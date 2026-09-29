@@ -298,10 +298,12 @@ defmodule Horde.DynamicSupervisorImpl do
   defp proxy_to_node(node_name, message, reply_to, state) do
     case Map.get(members(state), node_name) do
       %{status: :alive} ->
-        case(proxy_message_ttl(state, reply_to)) do
-          :infinity -> send(node_name, {:proxy_operation, message, reply_to})
-          ttl -> send(node_name, {:proxy_operation, message, reply_to, ttl})
-        end
+        Horde.ProxyOperation.forward(
+          node_name,
+          message,
+          reply_to,
+          proxy_message_ttl(state, reply_to)
+        )
 
         {:noreply, state}
 

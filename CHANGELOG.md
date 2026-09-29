@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Monitor in-flight proxied supervisor operations. If their destination disappears,
+  return `{:error, {:proxy_target_down, destination, reason}}` instead of leaving
+  the caller waiting indefinitely. This result is uncertain and is never retried
+  automatically. All peers must be upgraded to track subsequent forwarding hops.
+
 ## 0.10.0
 
 - Added optional TTL to Horde.DynamicSupervisor's `:proxy_operation` messages. The Time-to-Live defaults to :infinity for full backwards compatibility. This TTL helps prevent potential issues where messages could loop forever between a set of nodes which disagree on which node should execute the task.

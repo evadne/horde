@@ -14,6 +14,25 @@ defmodule Horde.DynamicSupervisor do
 
   While Horde wraps DynamicSupervisor, it does keep track of processes by the `id` in the child specification. This is a divergence from the behaviour of DynamicSupervisor, which ignores ids altogether. Using DynamicSupervisor is useful for its shutdown behaviour (it shuts down all child processes simultaneously, unlike `Supervisor`).
 
+  ## Interrupted remote operations
+
+  Proxied starts and terminations return
+  `{:error, {:proxy_target_down, destination, reason}}` if the selected supervisor
+  becomes unavailable before replying. This is an uncertain outcome, particularly
+  when `reason` is `:noconnection`: the remote operation might have completed.
+  Horde does not retry it automatically. Reconcile registered process ownership
+  before deciding whether to retry an operation.
+
+  A relay monitors the current destination, the original caller and the originating
+  supervisor, and exits when the operation replies or any of those processes dies.
+  As with `start_child/2`, there is no operation timeout while they remain alive.
+  Child initialisation should have an application-appropriate bound when it waits
+  for external resources. A caller that abandons a call but remains alive does not
+  cancel the remote operation or its relay.
+
+  Older peers can reply through the relay, but do not report subsequent forwarding
+  to it. Monitoring every hop therefore requires upgrading all cluster members.
+
   ## Graceful shutdown
 
   When a node is stopped (either manually or by calling `:init.stop`), Horde restarts the child processes of the stopped node on another node. The state of child processes is not preserved, they are simply restarted.
