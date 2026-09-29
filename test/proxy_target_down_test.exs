@@ -1,10 +1,8 @@
 defmodule Horde.ProxyTargetDownTest do
   use ExUnit.Case
 
-  defmodule LastMemberDistribution do
-    def has_quorum?(_members), do: true
-    def choose_node(_child_spec, members), do: {:ok, Enum.max_by(members, & &1.name)}
-  end
+  alias Horde.TestCluster, as: Cluster
+  alias Horde.ProxyTargetDownTest.LastMemberDistribution
 
   defmodule DependentChild do
     use GenServer
@@ -26,8 +24,8 @@ defmodule Horde.ProxyTargetDownTest do
     outer = :"outer_#{suffix}"
     first = :"dependency_a_#{suffix}"
     second = :"dependency_z_#{suffix}"
-    [remote_node] = LocalCluster.start_nodes("nested-proxy-#{suffix}", 1)
-    on_exit(fn -> LocalCluster.stop_nodes([remote_node]) end)
+    [remote] = Cluster.start_nodes("nested-proxy-#{suffix}", 1)
+    remote_node = remote.node
 
     for name <- [outer, first] do
       start_supervised!(%{
@@ -46,12 +44,12 @@ defmodule Horde.ProxyTargetDownTest do
     }
 
     assert {:ok, _} =
-             :erpc.call(remote_node, Supervisor, :start_child, [TestApp.Supervisor, remote_spec])
+             Cluster.call(remote, Supervisor, :start_child, [TestApp.Supervisor, remote_spec])
 
     remote_member = {second, remote_node}
     :ok = Horde.Cluster.set_members(first, [first, remote_member])
     await(fn -> map_size(:sys.get_state(first).name_to_supervisor_ref) == 2 end)
-    selected_pid = :erpc.call(remote_node, Process, :whereis, [second])
+    selected_pid = Cluster.call(remote, Process, :whereis, [second])
     :ok = :sys.suspend(selected_pid)
     observer = self()
 
@@ -68,12 +66,12 @@ defmodule Horde.ProxyTargetDownTest do
     try do
       await(fn ->
         {:messages, messages} =
-          :erpc.call(remote_node, Process, :info, [selected_pid, :messages])
+          Cluster.call(remote, Process, :info, [selected_pid, :messages])
 
         Enum.any?(messages, &match?({:proxy_operation, {:start_child, _}, _}, &1))
       end)
 
-      true = :erpc.call(remote_node, Process, :exit, [selected_pid, :kill])
+      true = Cluster.call(remote, Process, :exit, [selected_pid, :kill])
       failure = {:badmatch, {:error, {:proxy_target_down, remote_member, :killed}}}
 
       assert {:ok, {:error, {^failure, _stack}}} =
@@ -100,25 +98,99 @@ defmodule Horde.ProxyTargetDownTest do
   end
 
   test "reports an uncertain outcome when the distribution connection is lost" do
-    [remote_node] =
-      LocalCluster.start_nodes("proxy-loss-#{System.unique_integer([:positive])}", 1)
+    [remote] = Cluster.start_nodes("proxy-loss", 1)
+    remote_node = remote.node
 
-    on_exit(fn ->
-      LocalCluster.stop_nodes([remote_node])
-    end)
-
-    destination = :erpc.call(remote_node, :erlang, :spawn, [Process, :sleep, [:infinity]])
+    destination = Cluster.call(remote, :erlang, :spawn, [Process, :sleep, [:infinity]])
     tag = make_ref()
     :ok = Horde.ProxyOperation.forward(destination, :request, {self(), tag}, :infinity)
 
     await(fn ->
-      {:messages, messages} = :erpc.call(remote_node, Process, :info, [destination, :messages])
+      {:messages, messages} = Cluster.call(remote, Process, :info, [destination, :messages])
       Enum.any?(messages, &match?({:proxy_operation, :request, _}, &1))
     end)
 
-    assert true = Node.disconnect(remote_node)
+    Cluster.partition([[remote]])
     assert_receive {^tag, {:error, {:proxy_target_down, ^destination, :noconnection}}}, 1_000
     refute remote_node in Node.list()
+    assert Cluster.call(remote, Process, :alive?, [destination])
+    Cluster.heal([remote])
+    assert Cluster.call(remote, Process, :alive?, [destination])
+  end
+
+  test "a start reports uncertainty while the live remote destination later completes it once" do
+    [remote] = Cluster.start_nodes("pending-start", 1)
+    first = :pending_start_a
+    second = :pending_start_z
+
+    specification = fn name ->
+      %{
+        id: name,
+        start:
+          {Horde.DynamicSupervisor, :start_link,
+           [[name: name, strategy: :one_for_one, distribution_strategy: LastMemberDistribution]]},
+        restart: :temporary
+      }
+    end
+
+    start_supervised!(specification.(first))
+
+    {:ok, _} =
+      Cluster.call(remote, Supervisor, :start_child, [TestApp.Supervisor, specification.(second)])
+
+    member = {second, remote.node}
+    :ok = Horde.Cluster.set_members(first, [first, member])
+    await(fn -> map_size(:sys.get_state(first).name_to_supervisor_ref) == 2 end)
+    destination = Cluster.call(remote, Process, :whereis, [second])
+    processes = Cluster.call(remote, Process, :whereis, [:"#{second}.ProcessesSupervisor"])
+    :ok = Cluster.call(remote, :sys, :suspend, [processes])
+
+    task =
+      Task.async(fn ->
+        Horde.DynamicSupervisor.start_child(first, %{
+          id: Agent,
+          start: {Agent, :start_link, [Map, :new, []]}
+        })
+      end)
+
+    try do
+      await(fn ->
+        {:messages, messages} = Cluster.call(remote, Process, :info, [processes, :messages])
+        Enum.any?(messages, &match?({:"$gen_call", _, {:start_child, _}}, &1))
+      end)
+
+      Cluster.partition([[remote]])
+
+      assert {:ok, {:error, {:proxy_target_down, ^member, :noconnection}}} =
+               Task.yield(task, 1_000) || Task.shutdown(task, :brutal_kill)
+
+      assert destination == Cluster.call(remote, Process, :whereis, [second])
+
+      assert processes ==
+               Cluster.call(remote, Process, :whereis, [:"#{second}.ProcessesSupervisor"])
+
+      assert is_map(GenServer.call(first, :get_telemetry, 1_000))
+      :ok = Cluster.call(remote, :sys, :resume, [processes])
+
+      # The caller has already received an error, but the operation was accepted
+      # remotely and can still finish. There must be no automatic retry.
+      Cluster.await("the accepted start to finish on the isolated destination", fn ->
+        length(Cluster.call(remote, Horde.ProcessesSupervisor, :which_children, [processes])) == 1
+      end)
+
+      [{_, child, _, _}] =
+        Cluster.call(remote, Horde.ProcessesSupervisor, :which_children, [processes])
+
+      assert %{} == Cluster.call(remote, :sys, :get_state, [child])
+      assert [] == Horde.ProcessesSupervisor.which_children(:"#{first}.ProcessesSupervisor")
+      Cluster.assert_partition([[remote]])
+      Cluster.heal([remote])
+      await(fn -> :ets.member(:sys.get_state(first).process_pid_to_id, child) end)
+      assert [{_, ^child, _, _}] = Horde.DynamicSupervisor.which_children(first)
+    after
+      Cluster.call(remote, :sys, :resume, [processes])
+      Task.shutdown(task, :brutal_kill)
+    end
   end
 
   test "a proxied start returns when its selected supervisor disappears" do
