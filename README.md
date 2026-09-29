@@ -116,3 +116,26 @@ An opinionated but configurable means of quickly creating GenServer modules that
 # Contributing
 
 Contributions are welcome! Feel free to open an issue if you'd like to discuss a problem or a possible solution. Pull requests are much appreciated.
+
+## Running the tests
+
+Run `mix deps.get` and `mix test`. The test tooling requires OTP 25 or later
+and Elixir 1.15 or later; this does not change Horde's runtime requirements.
+CI covers OTP 25–29 with compatible Elixir versions. OTP 24 is no longer in
+the test matrix because it does not provide `:peer`.
+
+Distributed tests use `:peer` with a standard-I/O control channel. The nodes
+remain alive when Erlang distribution is disconnected, and observations and
+cleanup do not reconnect them. Partition tests give each component a different
+cookie to prevent automatic reconnection, then restore the cookies on healing.
+They keep `prevent_overlapping_partitions` enabled and verify the actual topology
+and process identities before checking recovery. Do not disable this protection
+in `ERL_FLAGS` or `ELIXIR_ERL_OPTIONS`; the suite rejects that configuration.
+
+The previously skipped two-node and four-node partition scenarios are covered by
+enabled tests with bounded convergence checks. The four-node scenario uses 20
+named workers to test availability and duplicate resolution, not the former
+1,000-worker stress workload. Workers follow the documented transient-restart
+and registry-conflict protocol. These tests distinguish a surviving partition
+from node death; they do not promise single ownership during a partition or
+exhaustively explore every network failure.

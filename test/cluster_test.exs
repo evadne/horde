@@ -1,5 +1,6 @@
 defmodule ClusterTest do
   use ExUnit.Case, async: false
+  alias Horde.TestCluster, as: Cluster
 
   describe "members option" do
     test "can join registry by specifying members in init" do
@@ -203,13 +204,11 @@ defmodule ClusterTest do
   describe "auto cluster membership" do
     setup do
       cluster = "cluster-#{:rand.uniform(1000)}"
-      nodes = LocalCluster.start_nodes(cluster, 2)
+      peers = Cluster.start_nodes(cluster, 2)
+      nodes = Cluster.nodes(peers)
+      Cluster.heal(peers)
 
-      on_exit(fn ->
-        :erpc.multicall(Node.list([:visible, :this]), Horde.NodeListener, :clear_all, [])
-      end)
-
-      {:ok, cluster: cluster, nodes: nodes, all_nodes: Enum.sort([node() | nodes])}
+      {:ok, cluster: cluster, peers: peers, nodes: nodes, all_nodes: Enum.sort([node() | nodes])}
     end
 
     test "supervisor should be registered on all clusters", ctx do
@@ -250,7 +249,9 @@ defmodule ClusterTest do
 
       Process.sleep(500)
 
-      [new] = LocalCluster.start_nodes("extra-cluster", 1)
+      [new_peer] = Cluster.start_nodes("extra-cluster", 1)
+      new = new_peer.node
+      Cluster.heal([new_peer | ctx.peers])
 
       Process.sleep(500)
 
@@ -268,7 +269,7 @@ defmodule ClusterTest do
 
       Process.sleep(500)
 
-      LocalCluster.stop_nodes([hd(ctx.nodes)])
+      Cluster.stop(hd(ctx.peers))
 
       Process.sleep(500)
 
