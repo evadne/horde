@@ -33,6 +33,22 @@ defmodule Horde.TestCluster do
 
   def nodes(peers), do: Enum.map(peers, & &1.node)
 
+  def await_supervised(peers, pids) do
+    await("replication of the supervised processes before changing topology", fn ->
+      Enum.all?(peers, fn peer ->
+        call(peer, __MODULE__, :supervised_pids, [TestSup]) |> Enum.sort() == Enum.sort(pids)
+      end)
+    end)
+  end
+
+  def supervised_pids(supervisor) do
+    supervisor
+    |> :sys.get_state()
+    |> Map.fetch!(:processes_by_id)
+    |> :ets.tab2list()
+    |> Enum.map(fn {_id, {_member, _specification, pid}} -> pid end)
+  end
+
   def call(peer, module, function, arguments) do
     :peer.call(peer.controller, module, function, arguments, 5_000)
   end
