@@ -276,7 +276,10 @@ defmodule Horde.DynamicSupervisor do
   Works like `DynamicSupervisor.terminate_child/2`.
   """
   @spec terminate_child(Supervisor.supervisor(), child_pid :: pid()) ::
-          :ok | {:error, :not_found} | {:error, {:node_dead_or_shutting_down, String.t()}}
+          :ok
+          | {:error, :not_found}
+          | {:error, {:node_dead_or_shutting_down, String.t()}}
+          | {:error, {:proxy_target_down, {atom(), node()}, term()}}
   def terminate_child(supervisor, child_pid) when is_pid(child_pid),
     do: call(supervisor, {:terminate_child, child_pid})
 

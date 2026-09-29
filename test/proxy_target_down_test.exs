@@ -122,6 +122,52 @@ defmodule Horde.ProxyTargetDownTest do
   end
 
   test "a proxied start returns when its selected supervisor disappears" do
+    {first, second} = start_pair()
+    selected_pid = Process.whereis(second)
+    :ok = :sys.suspend(selected_pid)
+
+    task =
+      Task.async(fn ->
+        Horde.DynamicSupervisor.start_child(first, {Agent, fn -> :started end})
+      end)
+
+    await(fn ->
+      {:messages, messages} = Process.info(selected_pid, :messages)
+      Enum.any?(messages, &match?({:proxy_operation, {:start_child, _}, _}, &1))
+    end)
+
+    Process.exit(selected_pid, :kill)
+
+    assert {:ok, {:error, {:proxy_target_down, {^second, _}, :killed}}} =
+             Task.yield(task, 1_000) || Task.shutdown(task, :brutal_kill)
+
+    assert is_map(GenServer.call(first, :get_telemetry, 1_000))
+    assert :ok = Horde.Cluster.set_members(first, [first])
+  end
+
+  test "a proxied termination returns uncertainty when its owning supervisor disappears" do
+    {first, second} = start_pair()
+    {:ok, child} = Horde.DynamicSupervisor.start_child(first, {Agent, fn -> :started end})
+    await(fn -> :ets.member(:sys.get_state(first).process_pid_to_id, child) end)
+    selected_pid = Process.whereis(second)
+    :ok = :sys.suspend(selected_pid)
+    task = Task.async(fn -> Horde.DynamicSupervisor.terminate_child(first, child) end)
+
+    await(fn ->
+      {:messages, messages} = Process.info(selected_pid, :messages)
+      Enum.any?(messages, &match?({:proxy_operation, {:terminate_child, ^child}, _}, &1))
+    end)
+
+    Process.exit(selected_pid, :kill)
+
+    assert {:ok, {:error, {:proxy_target_down, {^second, _}, :killed}}} =
+             Task.yield(task, 1_000) || Task.shutdown(task, :brutal_kill)
+
+    assert is_map(GenServer.call(first, :get_telemetry, 1_000))
+    assert :ok = Horde.Cluster.set_members(first, [first])
+  end
+
+  defp start_pair do
     suffix = System.unique_integer([:positive])
     first = :"proxy_a_#{suffix}"
     second = :"proxy_z_#{suffix}"
@@ -146,26 +192,7 @@ defmodule Horde.ProxyTargetDownTest do
     :ok = Horde.Cluster.set_members(first, [first, second])
     await(fn -> length(Horde.Cluster.members(second)) == 2 end)
     await(fn -> map_size(:sys.get_state(first).name_to_supervisor_ref) == 2 end)
-    selected_pid = Process.whereis(second)
-    :ok = :sys.suspend(selected_pid)
-
-    task =
-      Task.async(fn ->
-        Horde.DynamicSupervisor.start_child(first, {Agent, fn -> :started end})
-      end)
-
-    await(fn ->
-      {:messages, messages} = Process.info(selected_pid, :messages)
-      Enum.any?(messages, &match?({:proxy_operation, {:start_child, _}, _}, &1))
-    end)
-
-    Process.exit(selected_pid, :kill)
-
-    assert {:ok, {:error, {:proxy_target_down, {^second, _}, :killed}}} =
-             Task.yield(task, 1_000) || Task.shutdown(task, :brutal_kill)
-
-    assert is_map(GenServer.call(first, :get_telemetry, 1_000))
-    assert :ok = Horde.Cluster.set_members(first, [first])
+    {first, second}
   end
 
   defp await(check, attempts \\ 100)
