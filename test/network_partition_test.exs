@@ -31,6 +31,7 @@ defmodule NetworkPartitionTest do
     owner = Enum.find(peers, &(&1.node == node(original)))
     assert :ok = Cluster.call(owner, Worker, :set_state, [original, "preserved"])
     await_registered(peers, "partition-worker", original)
+    Cluster.await_supervised(peers, [original])
     identities = Enum.map(peers, &Cluster.call(&1, Process, :whereis, [TestApp.Supervisor]))
 
     Cluster.partition([[first], [second]])
@@ -73,6 +74,7 @@ defmodule NetworkPartitionTest do
   } do
     {:ok, original} = Cluster.call(first, Worker, :start, ["stopped-worker"])
     await_registered(peers, "stopped-worker", original)
+    Cluster.await_supervised(peers, [original])
     owner = Enum.find(peers, &(&1.node == node(original)))
     survivor = Enum.find(peers, &(&1 != owner))
     Cluster.stop(owner)

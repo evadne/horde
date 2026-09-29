@@ -15,6 +15,7 @@ defmodule NetSplitTest do
     names = Enum.map(1..20, &"worker-#{&1}")
     for name <- names, do: assert({:ok, _} = Cluster.call(first, Worker, :start, [name]))
     await_names(peers, names)
+    Cluster.await_supervised(peers, Enum.map(names, &lookup(first, &1)))
     identities = Enum.map(peers, &Cluster.call(&1, Process, :whereis, [TestApp.Supervisor]))
 
     Cluster.partition(groups)
