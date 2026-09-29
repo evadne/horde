@@ -164,7 +164,7 @@ defmodule Horde.Registry do
              sync_interval: flags.delta_crdt_options.sync_interval,
              max_sync_size: flags.delta_crdt_options.max_sync_size,
              shutdown: flags.delta_crdt_options.shutdown,
-             crdt: DeltaCrdt.AWLWWMap,
+             crdt: Horde.RegistryCrdt,
              on_diffs: {Horde.RegistryImpl, :on_diffs, [name]},
              name: crdt_name(name)
            ]},
