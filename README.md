@@ -139,3 +139,20 @@ named workers to test availability and duplicate resolution, not the former
 and registry-conflict protocol. These tests distinguish a surviving partition
 from node death; they do not promise single ownership during a partition or
 exhaustively explore every network failure.
+
+### Known recovery failure exposed by the enabled suite
+
+The four-node test remains capable of failing during partition formation, with
+some supervisor child records missing and registry entries pointing to the other
+component after the topology has settled. CI run
+[36640977093](https://github.com/evadne/horde/actions/runs/36640977093) captured
+this on OTP 25, 26, 28 and 29. The owner-specific registry cleanup repair addresses
+a separately reproduced deletion race; it does not establish that this broader
+recovery failure is fixed. Failed tests print each peer's topology, membership,
+children and CRDT registrations for diagnosis. The assertion stays enabled.
+
+Local passing runs and a subsequent green matrix do not invalidate that evidence.
+Partition formation can involve intermediate disconnections and concurrent child
+replacement; the precise loss mechanism still needs a deterministic reproduction.
+Do not interpret this integration branch as establishing complete partition
+recovery or as production rollout approval.
