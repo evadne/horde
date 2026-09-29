@@ -6,6 +6,10 @@
   return `{:error, {:proxy_target_down, destination, reason}}` instead of leaving
   the caller waiting indefinitely. This result is uncertain and is never retried
   automatically. All peers must be upgraded to track subsequent forwarding hops.
+- Remove only a departing registry owner's CRDT contributions. Delayed exit
+  notifications and non-owner unregister calls can no longer erase a newer
+  holder's registration. The CRDT state and wire format remain AWLWWMap-compatible;
+  all members need the fix to prevent old peers from issuing destructive cleanup.
 
 ## 0.10.0
 

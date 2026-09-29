@@ -115,11 +115,7 @@ defmodule Horde.RegistryImpl do
   def handle_info({:EXIT, pid, _reason}, state) do
     case :ets.take(state.pids_ets_table, pid) do
       [{_pid, keys}] ->
-        DeltaCrdt.drop(
-          crdt_name(state.name),
-          Enum.map(keys, fn key -> {:key, key} end),
-          :infinity
-        )
+        Horde.RegistryCrdt.drop_owned(crdt_name(state.name), keys, pid)
 
         Enum.each(keys, fn key ->
           :ets.match_delete(state.keys_ets_table, {key, :_, {pid, :_}})
@@ -329,7 +325,7 @@ defmodule Horde.RegistryImpl do
   end
 
   def handle_call({:unregister, key, pid}, _from, state) do
-    DeltaCrdt.delete(crdt_name(state.name), {:key, key}, :infinity)
+    Horde.RegistryCrdt.drop_owned(crdt_name(state.name), [key], pid)
 
     unregister_local(state, key, pid)
 
