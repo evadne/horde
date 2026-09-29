@@ -20,21 +20,33 @@ defmodule NetSplitTest do
 
     Cluster.partition(groups)
 
-    for group <- groups do
-      Cluster.await("one registered worker per name in the component", fn ->
-        Enum.all?(names, fn name ->
-          pids = Enum.map(group, &lookup(&1, name))
+    try do
+      for group <- groups do
+        Cluster.await("one registered worker per name in the component", fn ->
+          Enum.all?(names, fn name ->
+            pids = Enum.map(group, &lookup(&1, name))
 
-          case Enum.uniq(pids) do
-            [pid] when is_pid(pid) ->
-              node(pid) in Cluster.nodes(group) and
-                Cluster.call(Enum.find(group, &(&1.node == node(pid))), Process, :alive?, [pid])
+            case Enum.uniq(pids) do
+              [pid] when is_pid(pid) ->
+                node(pid) in Cluster.nodes(group) and
+                  Cluster.call(Enum.find(group, &(&1.node == node(pid))), Process, :alive?, [pid])
 
-            _ ->
-              false
-          end
+              _ ->
+                false
+            end
+          end)
         end)
-      end)
+      end
+    rescue
+      error in ExUnit.AssertionError ->
+        for peer <- peers do
+          IO.inspect(Cluster.call(peer, Cluster, :recovery_snapshot, []),
+            label: "Partition recovery #{peer.node}",
+            limit: :infinity
+          )
+        end
+
+        reraise error, __STACKTRACE__
     end
 
     Cluster.assert_partition(groups)
