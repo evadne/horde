@@ -373,14 +373,18 @@ defmodule RegistryTest do
       Horde.Cluster.set_members(horde, [horde, horde2])
 
       Horde.Registry.register(horde, :one_day_fly, "value")
-      assert %{one_day_fly: _id} = processes(horde)
-      Process.sleep(200)
-      assert %{one_day_fly: _id} = processes(horde2)
+
+      Horde.TestCluster.await("publication of the registration on both members", fn ->
+        match?(%{one_day_fly: _id}, processes(horde)) and
+          match?(%{one_day_fly: _id}, processes(horde2))
+      end)
 
       Horde.Registry.unregister(horde, :one_day_fly)
       assert %{} == processes(horde)
-      Process.sleep(200)
-      assert %{} == processes(horde2)
+
+      Horde.TestCluster.await("replication of the unregistration", fn ->
+        processes(horde2) == %{}
+      end)
     end
   end
 

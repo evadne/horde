@@ -49,6 +49,18 @@ defmodule Horde.TestCluster do
     |> Enum.map(fn {_id, {_member, _specification, pid}} -> pid end)
   end
 
+  def recovery_snapshot do
+    state = :sys.get_state(TestSup)
+
+    %{
+      connected: Node.list(),
+      members: state.members_info,
+      supervised: :ets.tab2list(state.processes_by_id),
+      children: Horde.ProcessesSupervisor.which_children(TestSup.ProcessesSupervisor),
+      registry: DeltaCrdt.to_map(TestReg.Crdt)
+    }
+  end
+
   def call(peer, module, function, arguments) do
     :peer.call(peer.controller, module, function, arguments, 5_000)
   end
