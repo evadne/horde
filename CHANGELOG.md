@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Remove only a departing registry owner's CRDT contributions. Delayed exit
+  notifications and non-owner unregister calls can no longer erase a newer
+  holder's registration. The CRDT state and wire format remain AWLWWMap-compatible;
+  all members need the fix to prevent old peers from issuing destructive cleanup.
+
 ## 0.10.0
 
 - Added optional TTL to Horde.DynamicSupervisor's `:proxy_operation` messages. The Time-to-Live defaults to :infinity for full backwards compatibility. This TTL helps prevent potential issues where messages could loop forever between a set of nodes which disagree on which node should execute the task.
