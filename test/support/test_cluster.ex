@@ -68,9 +68,7 @@ defmodule Horde.TestCluster do
 
     # global can discard additional connections while a split forms. Restore
     # each intended, fully connected component without disabling that protection.
-    for group <- groups, peer <- group, other <- group, peer != other do
-      true = call(peer, Node, :connect, [other.node])
-    end
+    for group <- groups, do: connect(group, nodes(group))
 
     assert_partition(groups)
   end
@@ -90,14 +88,22 @@ defmodule Horde.TestCluster do
       true = call(peer, :erlang, :set_cookie, [other, Node.get_cookie()])
     end
 
-    for peer <- peers, other <- [node() | nodes(peers)], other != peer.node do
-      true = call(peer, Node, :connect, [other])
-    end
+    connect(peers, [node() | nodes(peers)])
+  end
 
-    await("the healed cluster topology", fn ->
+  defp connect(peers, expected) do
+    # A connection attempt can race with an outstanding global disconnect or
+    # authentication handshake. Retry the requested network operation within
+    # the deadline, then synchronise global before accepting the topology.
+    await("the connected component #{inspect(expected)}", fn ->
+      for peer <- peers, other <- expected, other != peer.node do
+        call(peer, Node, :connect, [other])
+      end
+
+      for peer <- peers, do: call(peer, :global, :sync, [])
+
       Enum.all?(peers, fn peer ->
-        Enum.sort(call(peer, Node, :list, [])) ==
-          Enum.sort([node() | nodes(peers)] -- [peer.node])
+        Enum.sort(call(peer, Node, :list, [])) == Enum.sort(expected -- [peer.node])
       end)
     end)
   end

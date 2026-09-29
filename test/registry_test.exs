@@ -915,6 +915,12 @@ defmodule RegistryTest do
       end)
 
     assert_receive {:ok, owner}
+    # Since Horde 0.9, even local registration is published asynchronously (see
+    # upstream issue 250). Establish visibility before testing duplicate rejection.
+    Horde.TestCluster.await("the initial registration to become visible", fn ->
+      Horde.Registry.lookup(registry, key) == [{task, value}]
+    end)
+
     {owner, task}
   end
 
