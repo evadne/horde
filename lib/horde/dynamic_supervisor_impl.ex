@@ -1,7 +1,7 @@
 defmodule Horde.DynamicSupervisor.Member do
   @type t :: %Horde.DynamicSupervisor.Member{}
   @type status :: :uninitialized | :alive | :shutting_down | :dead
-  defstruct [:status, :name]
+  defstruct [:status, :name, :pid]
 end
 
 defmodule Horde.DynamicSupervisorImpl do
@@ -10,6 +10,8 @@ defmodule Horde.DynamicSupervisorImpl do
   require Logger
   use GenServer
   import Horde.TableUtils
+
+  @recovery_retry_interval 1_000
 
   defstruct name: nil,
             members: %{},
@@ -20,6 +22,11 @@ defmodule Horde.DynamicSupervisorImpl do
             waiting_for_quorum: [],
             supervisor_ref_to_name: %{},
             name_to_supervisor_ref: %{},
+            unavailable_members: %{},
+            member_observations: %{},
+            local_processes: %{},
+            pending_recoveries: %{},
+            recovery_retry_timer: nil,
             shutting_down: false,
             supervisor_options: [],
             proxy_message_ttl: :infinity,
@@ -44,6 +51,7 @@ defmodule Horde.DynamicSupervisorImpl do
     Logger.info("Starting #{inspect(__MODULE__)} with name #{inspect(name)}")
 
     Process.flag(:trap_exit, true)
+    :ok = :net_kernel.monitor_nodes(true, node_type: :visible)
 
     state =
       %__MODULE__{
@@ -87,7 +95,8 @@ defmodule Horde.DynamicSupervisorImpl do
   defp node_info(state) do
     %Horde.DynamicSupervisor.Member{
       status: node_status(state),
-      name: fully_qualified_name(state.name)
+      name: fully_qualified_name(state.name),
+      pid: self()
     }
   end
 
@@ -112,6 +121,22 @@ defmodule Horde.DynamicSupervisorImpl do
     {:reply, telemetry, state}
   end
 
+  def handle_call(:local_processes, _from, state) do
+    processes =
+      Enum.map(state.local_processes, fn {id, {spec, pid}} -> {id, pid, spec} end)
+
+    {:reply, processes, state}
+  end
+
+  def handle_call(:local_process_records, _from, state) do
+    owner = fully_qualified_name(state.name)
+
+    records =
+      for {id, {^owner, spec, pid}} <- :ets.tab2list(state.processes_by_id), do: {id, pid, spec}
+
+    {:reply, records, state}
+  end
+
   def handle_call(:wait_for_quorum, from, state) do
     if state.distribution_strategy.has_quorum?(Map.values(members(state))) do
       {:reply, :ok, state}
@@ -129,18 +154,26 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   def handle_call({:terminate_child, child_pid} = msg, from, state) do
-    this_name = fully_qualified_name(state.name)
+    # Replication can select another partition's copy of the same logical ID.
+    # A caller naming our actual child must still be able to terminate it.
+    local_child =
+      Enum.find_value(state.local_processes, fn
+        {_id, {spec, ^child_pid}} -> spec
+        _ -> nil
+      end)
 
-    with child_id when not is_nil(child_id) <- get_item(state.process_pid_to_id, child_pid),
-         {^this_name, child, _child_pid} <- get_item(state.processes_by_id, child_id),
-         {reply, new_state} <- terminate_child(child, state) do
-      {:reply, reply, new_state}
+    if local_child do
+      {reply, state} = terminate_child(local_child, state)
+      {:reply, reply, state}
     else
-      {other_node, _child_spec, _child_pid} ->
-        proxy_to_node(other_node, msg, from, state)
-
-      nil ->
-        {:reply, {:error, :not_found}, state}
+      with child_id when not is_nil(child_id) <- get_item(state.process_pid_to_id, child_pid),
+           {other_node, _child, _pid} <- get_item(state.processes_by_id, child_id) do
+        if other_node == fully_qualified_name(state.name),
+          do: {:reply, {:error, :not_found}, state},
+          else: proxy_to_node(other_node, msg, from, state)
+      else
+        nil -> {:reply, {:error, :not_found}, state}
+      end
     end
   end
 
@@ -215,45 +248,31 @@ defmodule Horde.DynamicSupervisorImpl do
   def handle_cast({:relinquish_child_process, child_id}, state) do
     # signal to the rest of the nodes that this process has been relinquished
     # (to the Horde!) by its parent
-    with {_, child, _} <- get_item(state.processes_by_id, child_id) do
-      DeltaCrdt.put(
-        crdt_name(state.name),
-        {:process, child.id},
-        {nil, child},
-        :infinity
-      )
+    with {child, pid} <- Map.get(state.local_processes, child_id) do
+      Horde.DynamicSupervisorCrdt.relinquish_owned(crdt_name(state.name), child.id, pid, child)
     end
 
-    {:noreply, state}
+    {:noreply, forget_local_process(state, child_id)}
   end
 
   # TODO think of a better name than "disown_child_process"
   def handle_cast({:disown_child_process, child_id}, state) do
-    {value, new_processes_by_id} = pop_item(state.processes_by_id, child_id)
+    case Map.get(state.local_processes, child_id) do
+      {_spec, pid} ->
+        state = forget_local_process(state, child_id)
+        Horde.DynamicSupervisorCrdt.drop_owned(crdt_name(state.name), child_id, pid)
+        {:noreply, state}
 
-    new_state =
-      case value do
-        {_, _, child_pid} ->
-          DeltaCrdt.delete(crdt_name(state.name), {:process, child_id}, :infinity)
-
-          %{
-            state
-            | processes_by_id: new_processes_by_id,
-              process_pid_to_id: delete_item(state.process_pid_to_id, child_pid),
-              local_process_count: state.local_process_count - 1
-          }
-
-        nil ->
-          # Item not found
-          state
-      end
-
-    {:noreply, new_state}
+      nil ->
+        {:noreply, state}
+    end
   end
 
   defp set_child_pid(state, child_id, new_child_pid) do
-    case get_item(state.processes_by_id, child_id) do
-      {name, child_spec, old_pid} ->
+    case Map.get(state.local_processes, child_id) do
+      {child_spec, old_pid} ->
+        name = fully_qualified_name(state.name)
+
         DeltaCrdt.put(
           crdt_name(state.name),
           {:process, child_spec.id},
@@ -270,7 +289,8 @@ defmodule Horde.DynamicSupervisorImpl do
         %{
           state
           | processes_by_id: new_processes_by_id,
-            process_pid_to_id: new_process_pid_to_id
+            process_pid_to_id: new_process_pid_to_id,
+            local_processes: Map.put(state.local_processes, child_id, {child_spec, new_child_pid})
         }
 
       nil ->
@@ -343,17 +363,6 @@ defmodule Horde.DynamicSupervisorImpl do
     Map.put(state, :members_info, new_members_info)
   end
 
-  defp mark_dead(state, name) do
-    DeltaCrdt.put(
-      crdt_name(state.name),
-      {:member_node_info, name},
-      %Horde.DynamicSupervisor.Member{name: name, status: :dead},
-      :infinity
-    )
-
-    state
-  end
-
   def handle_info({:set_members, members}, state) do
     {:noreply, set_members(members, state)}
   end
@@ -375,20 +384,70 @@ defmodule Horde.DynamicSupervisorImpl do
     end
   end
 
-  def handle_info({:DOWN, ref, _type, _pid, _reason}, state) do
+  def handle_info({:DOWN, ref, _type, _pid, reason}, state) do
     case Map.get(state.supervisor_ref_to_name, ref) do
       nil ->
         {:noreply, state}
 
       name ->
+        # A monitor reports this observer's reachability. In an overlapping
+        # partition, another member may still reach the same live supervisor.
+        # Publishing :dead would make those observers repeatedly contradict
+        # the owner's :alive record and redistribute healthy processes.
         new_state =
-          mark_dead(state, name)
-          |> set_own_node_status()
-          |> Map.put(:supervisor_ref_to_name, Map.delete(state.supervisor_ref_to_name, ref))
-          |> Map.put(:name_to_supervisor_ref, Map.delete(state.name_to_supervisor_ref, name))
+          forget_monitor(state, name)
+          |> Map.put(:unavailable_members, Map.put(state.unavailable_members, name, reason))
+          |> publish_observation()
+          |> handle_quorum_change()
+          |> handoff_processes()
 
         {:noreply, new_state}
     end
+  end
+
+  def handle_info({:nodeup, node, _info}, state) do
+    state =
+      Enum.reduce(state.members, state, fn
+        {{_name, ^node} = member, _}, state ->
+          forget_monitor(state, member)
+          |> Map.update!(:unavailable_members, &Map.delete(&1, member))
+
+        _, state ->
+          state
+      end)
+
+    {:noreply,
+     state
+     |> monitor_supervisors()
+     |> publish_observation()
+     |> handle_quorum_change()
+     |> handoff_processes()}
+  end
+
+  def handle_info({:nodedown, node, _info}, state) do
+    state =
+      Enum.reduce(state.members, state, fn
+        {{_name, ^node} = member, _}, state ->
+          forget_monitor(state, member)
+          |> Map.update!(:unavailable_members, &Map.put(&1, member, :noconnection))
+
+        _, state ->
+          state
+      end)
+
+    {:noreply, state |> publish_observation() |> handle_quorum_change() |> handoff_processes()}
+  end
+
+  def handle_info(:retry_recoveries, state) do
+    processes =
+      Enum.flat_map(state.pending_recoveries, fn {id, _reason} ->
+        case get_item(state.processes_by_id, id) do
+          nil -> []
+          process -> [process]
+        end
+      end)
+
+    {:noreply, handoff_processes(%{state | recovery_retry_timer: nil}, true, processes)}
   end
 
   @doc false
@@ -406,11 +465,27 @@ defmodule Horde.DynamicSupervisorImpl do
       if has_membership_changed?(diffs) do
         monitor_supervisors(new_state)
         |> set_own_node_status()
+        |> publish_observation()
         |> handle_quorum_change()
         |> set_crdt_neighbours()
         |> handoff_processes()
       else
-        new_state
+        # Specifications can arrive after the monitor that detected their
+        # owner disappearing. Only inspect those changed records here: scanning
+        # every child on every registration makes ordinary starts quadratic.
+        changed_processes =
+          Enum.flat_map(diffs, fn
+            {:add, {:process, id}, {_owner, _spec, _pid}} ->
+              case get_item(new_state.processes_by_id, id) do
+                nil -> []
+                process -> [process]
+              end
+
+            _ ->
+              []
+          end)
+
+        handoff_processes(new_state, false, changed_processes)
       end
 
     {:noreply, new_state}
@@ -420,6 +495,8 @@ defmodule Horde.DynamicSupervisorImpl do
   def has_membership_changed?([{:remove, {:member_node_info, _}} = _diff | _diffs]), do: true
   def has_membership_changed?([{:add, {:member, _}, _} = _diff | _diffs]), do: true
   def has_membership_changed?([{:remove, {:member, _}} = _diff | _diffs]), do: true
+  def has_membership_changed?([{:add, {:member_observation, _}, _} | _]), do: true
+  def has_membership_changed?([{:remove, {:member_observation, _}} | _]), do: true
 
   def has_membership_changed?([_diff | diffs]) do
     has_membership_changed?(diffs)
@@ -427,20 +504,20 @@ defmodule Horde.DynamicSupervisorImpl do
 
   def has_membership_changed?([]), do: false
 
-  defp handoff_processes(state) do
+  defp handoff_processes(state, retry? \\ false, processes \\ nil) do
     this_node = fully_qualified_name(state.name)
 
-    all_items_values(state.processes_by_id)
+    (processes || all_items_values(state.processes_by_id))
     |> Enum.reduce(state, fn {current_node, child_spec, _child_pid}, state ->
       case choose_node(child_spec, state) do
         {:ok, %{name: chosen_node}} ->
-          current_member = Map.get(state.members_info, current_node)
+          current_member = Map.get(members(state), current_node)
 
           case {current_node, chosen_node} do
             {same_node, same_node} ->
               # process is running on the node on which it belongs
 
-              state
+              clear_pending_recovery(state, child_spec.id)
 
             {^this_node, _other_node} ->
               # process is running here but belongs somewhere else
@@ -450,34 +527,96 @@ defmodule Horde.DynamicSupervisorImpl do
                   handoff_child(child_spec, state)
 
                 :passive ->
-                  state
+                  clear_pending_recovery(state, child_spec.id)
               end
 
             {_current_node, ^this_node} ->
               # process is running on another node but belongs here
 
-              case current_member do
-                %{status: :dead} ->
-                  DeltaCrdt.delete(crdt_name(state.name), {:process, child_spec.id}, :infinity)
-                  {_response, state} = add_child(randomize_child_id(child_spec), state)
-
+              if is_nil(current_member) or
+                   (match?(%{status: :dead}, current_member) and
+                      not MapSet.member?(observed_reachable_members(state), current_node)) do
+                if retry? or not Map.has_key?(state.pending_recoveries, child_spec.id) do
+                  recover_child(child_spec, state)
+                else
                   state
-
-                _ ->
-                  state
+                end
+              else
+                clear_pending_recovery(state, child_spec.id)
               end
 
             {_other_node1, _other_node2} ->
               # process is neither running here nor belongs here
 
-              state
+              clear_pending_recovery(state, child_spec.id)
           end
 
         {:error, _reason} ->
           state
       end
     end)
+    |> schedule_recovery_retry()
   end
+
+  defp recover_child(child_spec, state) do
+    {_owner, _spec, previous_pid} = get_item(state.processes_by_id, child_spec.id)
+
+    {response, state} =
+      case Map.get(state.local_processes, child_spec.id) do
+        {_spec, pid} ->
+          if Process.alive?(pid),
+            do: {{:ok, pid}, update_state_with_child(child_spec, pid, state)},
+            else: {{:error, :local_child_restarting}, state}
+
+        nil ->
+          # Keep the logical ID across takeover. Otherwise a late graceful
+          # relinquishment can start a second replacement under the old ID.
+          add_child(child_spec, state)
+      end
+
+    case response do
+      {:error, reason} ->
+        # Keep the old specification until a replacement actually exists. A
+        # failed start can mean that the previous owner is still running.
+        if Map.get(state.pending_recoveries, child_spec.id) != reason do
+          Logger.warning("Unable to recover child #{inspect(child_spec.id)}: #{inspect(reason)}")
+        end
+
+        %{state | pending_recoveries: Map.put(state.pending_recoveries, child_spec.id, reason)}
+
+      :ignore ->
+        # :ignore explicitly declines the child, as in DynamicSupervisor.
+        # A duplicate start must return {:error, {:already_started, pid}} if
+        # the original recovery obligation should be retained.
+        if is_pid(previous_pid),
+          do:
+            Horde.DynamicSupervisorCrdt.drop_owned(
+              crdt_name(state.name),
+              child_spec.id,
+              previous_pid
+            ),
+          else:
+            Horde.DynamicSupervisorCrdt.drop_relinquished(crdt_name(state.name), child_spec.id)
+
+        update_process(state, {:remove, {:process, child_spec.id}})
+
+      success when elem(success, 0) == :ok ->
+        clear_pending_recovery(state, child_spec.id)
+    end
+  end
+
+  defp clear_pending_recovery(state, id),
+    do: %{state | pending_recoveries: Map.delete(state.pending_recoveries, id)}
+
+  defp schedule_recovery_retry(%{recovery_retry_timer: nil, pending_recoveries: pending} = state)
+       when map_size(pending) > 0 do
+    # This retries a known failed local start, not an uncertain remote call and
+    # not a timeout-based declaration that another node has died.
+    timer = Process.send_after(self(), :retry_recoveries, @recovery_retry_interval)
+    %{state | recovery_retry_timer: timer}
+  end
+
+  defp schedule_recovery_retry(state), do: state
 
   defp update_processes(state, [diff | diffs]) do
     update_process(state, diff)
@@ -486,21 +625,20 @@ defmodule Horde.DynamicSupervisorImpl do
 
   defp update_processes(state, []), do: state
 
-  defp update_process(state, {:add, {:process, _child_id}, {nil, child_spec}}) do
+  defp update_process(state, {:add, {:process, child_id}, {nil, child_spec}}) do
     this_name = fully_qualified_name(state.name)
 
-    case choose_node(child_spec, state) do
-      {:ok, %{name: ^this_name}} ->
-        {_resp, new_state} = add_child(child_spec, state)
-        new_state
+    case Map.get(state.local_processes, child_id) do
+      {_spec, _pid} ->
+        restore_local_process(state, child_id)
 
-      {:ok, _} ->
-        # matches another node, do nothing
-        state
+      nil ->
+        state = update_process(state, {:add, {:process, child_id}, {nil, child_spec, nil}})
 
-      {:error, _reason} ->
-        # error (could be quorum), do nothing
-        state
+        case choose_node(child_spec, state) do
+          {:ok, %{name: ^this_name}} -> recover_child(child_spec, state)
+          _ -> state
+        end
     end
   end
 
@@ -510,15 +648,54 @@ defmodule Horde.DynamicSupervisorImpl do
         {_, _, old_pid} -> delete_item(state.process_pid_to_id, old_pid)
         nil -> state.process_pid_to_id
       end
-      |> put_item(child_pid, child_id)
+
+    new_process_pid_to_id =
+      if is_pid(child_pid),
+        do: put_item(new_process_pid_to_id, child_pid, child_id),
+        else: new_process_pid_to_id
 
     new_processes_by_id = put_item(state.processes_by_id, child_id, {node, child_spec, child_pid})
 
     Map.put(state, :processes_by_id, new_processes_by_id)
     |> Map.put(:process_pid_to_id, new_process_pid_to_id)
+    |> clear_pending_recovery(child_id)
   end
 
   defp update_process(state, {:remove, {:process, child_id}}) do
+    case Map.get(state.local_processes, child_id) do
+      {_spec, pid} when is_pid(pid) ->
+        if Process.alive?(pid) do
+          restore_local_process(state, child_id)
+        else
+          remove_process_record(state, child_id)
+        end
+
+      nil ->
+        remove_process_record(state, child_id)
+    end
+  end
+
+  defp update_process(state, _), do: state
+
+  defp restore_local_process(state, id) do
+    case Map.get(state.local_processes, id) do
+      {spec, pid} ->
+        if Process.alive?(pid) do
+          Horde.DynamicSupervisorCrdt.restore_owned(
+            crdt_name(state.name),
+            id,
+            {fully_qualified_name(state.name), spec, pid}
+          )
+        end
+
+        state
+
+      nil ->
+        state
+    end
+  end
+
+  defp remove_process_record(state, child_id) do
     {value, new_processes_by_id} = pop_item(state.processes_by_id, child_id)
 
     new_process_pid_to_id =
@@ -532,9 +709,8 @@ defmodule Horde.DynamicSupervisorImpl do
 
     Map.put(state, :processes_by_id, new_processes_by_id)
     |> Map.put(:process_pid_to_id, new_process_pid_to_id)
+    |> clear_pending_recovery(child_id)
   end
-
-  defp update_process(state, _), do: state
 
   defp update_members(state, [diff | diffs]) do
     update_member(state, diff)
@@ -554,10 +730,31 @@ defmodule Horde.DynamicSupervisorImpl do
   defp update_member(state, {:remove, {:member, member}}) do
     new_members = Map.delete(state.members, member)
 
-    Map.put(state, :members, new_members)
+    forget_monitor(state, member)
+    |> Map.put(:members, new_members)
+    |> Map.update!(:unavailable_members, &Map.delete(&1, member))
   end
 
+  defp update_member(state, {:add, {:member_observation, member}, observation}),
+    do: %{state | member_observations: Map.put(state.member_observations, member, observation)}
+
+  defp update_member(state, {:remove, {:member_observation, member}}),
+    do: %{state | member_observations: Map.delete(state.member_observations, member)}
+
   defp update_member(state, {:add, {:member_node_info, member}, node_info}) do
+    previous = Map.get(state.members_info, member)
+
+    state =
+      if is_pid(Map.get(node_info, :pid)) and
+           Map.get(previous || %{}, :pid) != node_info.pid do
+        # The owner's PID includes its VM incarnation. A restart on the same
+        # connected node must invalidate the previous monitor and suspicion.
+        forget_monitor(state, member)
+        |> Map.update!(:unavailable_members, &Map.delete(&1, member))
+      else
+        state
+      end
+
     new_members = Map.put(state.members_info, member, node_info)
 
     Map.put(state, :members_info, new_members)
@@ -602,10 +799,19 @@ defmodule Horde.DynamicSupervisorImpl do
     new_member_names = Map.keys(new_members_info) |> MapSet.new()
     existing_member_names = Map.keys(state.members) |> MapSet.new()
 
+    state =
+      MapSet.difference(existing_member_names, new_member_names)
+      |> Enum.reduce(state, &forget_monitor(&2, &1))
+      |> Map.update!(:unavailable_members, &Map.take(&1, Map.keys(new_members)))
+
     keys_to_remove =
       MapSet.difference(existing_member_names, new_member_names)
       |> Enum.flat_map(fn removed_member ->
-        [{:member, removed_member}, {:member_node_info, removed_member}]
+        [
+          {:member, removed_member},
+          {:member_node_info, removed_member},
+          {:member_observation, removed_member}
+        ]
       end)
 
     DeltaCrdt.drop(
@@ -622,8 +828,10 @@ defmodule Horde.DynamicSupervisorImpl do
 
     %{state | members: new_members, members_info: new_members_info}
     |> monitor_supervisors()
+    |> publish_observation()
     |> handle_quorum_change()
     |> set_crdt_neighbours()
+    |> handoff_processes()
   end
 
   defp handle_quorum_change(state) do
@@ -636,14 +844,11 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   defp shut_down_all_processes(state) do
-    case any_item(state.processes_by_id, processes_for_node(fully_qualified_name(state.name))) do
-      false ->
-        state
-
-      true ->
-        :ok = Horde.ProcessesSupervisor.stop(supervisor_name(state.name))
-        state
+    if map_size(state.local_processes) > 0 do
+      :ok = Horde.ProcessesSupervisor.stop(supervisor_name(state.name))
     end
+
+    state
   end
 
   defp set_crdt_neighbours(state) do
@@ -656,27 +861,20 @@ defmodule Horde.DynamicSupervisorImpl do
     state
   end
 
-  defp processes_for_node(node_name) do
-    fn
-      {_id, {^node_name, _child_spec, _child_pid}} -> true
-      _ -> false
-    end
-  end
-
   defp monitor_supervisors(state) do
     new_supervisor_refs =
       Enum.flat_map(members(state), fn
-        {name, %{status: :alive}} ->
-          [name]
+        {name, %{status: :alive} = member} ->
+          [{name, Map.get(member, :pid) || name}]
 
         _ ->
           []
       end)
-      |> Enum.reject(fn name ->
+      |> Enum.reject(fn {name, _target} ->
         Map.has_key?(state.name_to_supervisor_ref, name)
       end)
-      |> Map.new(fn name ->
-        {name, Process.monitor(name)}
+      |> Map.new(fn {name, target} ->
+        {name, Process.monitor(target)}
       end)
 
     new_supervisor_ref_to_name =
@@ -689,6 +887,74 @@ defmodule Horde.DynamicSupervisorImpl do
 
     Map.put(state, :supervisor_ref_to_name, new_supervisor_ref_to_name)
     |> Map.put(:name_to_supervisor_ref, new_name_to_supervisor_ref)
+  end
+
+  defp forget_monitor(state, member) do
+    case Map.pop(state.name_to_supervisor_ref, member) do
+      {nil, _} ->
+        state
+
+      {ref, names} ->
+        Process.demonitor(ref, [:flush])
+
+        %{
+          state
+          | name_to_supervisor_ref: names,
+            supervisor_ref_to_name: Map.delete(state.supervisor_ref_to_name, ref)
+        }
+    end
+  end
+
+  defp publish_observation(state) do
+    member = fully_qualified_name(state.name)
+
+    reachable =
+      Map.take(state.members_info, Map.keys(state.name_to_supervisor_ref))
+      |> Map.new(fn {name, info} -> {name, Map.get(info, :pid)} end)
+
+    observation = %{pid: self(), reachable: reachable}
+
+    if Map.get(state.member_observations, member) == observation do
+      state
+    else
+      DeltaCrdt.put(crdt_name(state.name), {:member_observation, member}, observation, :infinity)
+      %{state | member_observations: Map.put(state.member_observations, member, observation)}
+    end
+  end
+
+  defp observed_reachable_members(state) do
+    # Anchor the traversal in direct live observations. Disconnected components'
+    # old views cannot keep one another alive. Follow validated incarnations so
+    # a chain A--B--C--D can witness D without requiring a direct A--D link.
+    roots =
+      members(state)
+      |> Enum.flat_map(fn {name, info} -> if info.status == :alive, do: [name], else: [] end)
+
+    observation_closure(roots, MapSet.new(), state)
+  end
+
+  defp observation_closure([], seen, _state), do: seen
+
+  defp observation_closure([member | remaining], seen, state) do
+    if MapSet.member?(seen, member) do
+      observation_closure(remaining, seen, state)
+    else
+      targets =
+        with %{pid: pid, reachable: reachable} when is_pid(pid) <-
+               state.member_observations[member],
+             %{pid: ^pid} <- state.members_info[member] do
+          Enum.flat_map(reachable, fn {target, incarnation} ->
+            if Map.has_key?(state.members, target) and is_pid(incarnation) and
+                 Map.get(state.members_info[target] || %{}, :pid) == incarnation,
+               do: [target],
+               else: []
+          end)
+        else
+          _ -> []
+        end
+
+      observation_closure(remaining ++ targets, MapSet.put(seen, member), state)
+    end
   end
 
   defp update_state_with_child(child, child_pid, state) do
@@ -707,11 +973,12 @@ defmodule Horde.DynamicSupervisorImpl do
       )
 
     new_process_pid_to_id = put_item(state.process_pid_to_id, child_pid, child.id)
-    new_local_process_count = state.local_process_count + 1
+    local_processes = Map.put(state.local_processes, child.id, {child, child_pid})
 
     Map.put(state, :processes_by_id, new_processes_by_id)
     |> Map.put(:process_pid_to_id, new_process_pid_to_id)
-    |> Map.put(:local_process_count, new_local_process_count)
+    |> Map.put(:local_processes, local_processes)
+    |> Map.put(:local_process_count, map_size(local_processes))
   end
 
   defp handoff_child(child, state) do
@@ -728,7 +995,7 @@ defmodule Horde.DynamicSupervisorImpl do
           {:shutdown, :process_redistribution}
         )
 
-        Map.put(state, :local_process_count, state.local_process_count - 1)
+        state
 
       nil ->
         state
@@ -737,6 +1004,7 @@ defmodule Horde.DynamicSupervisorImpl do
 
   defp terminate_child(child, state) do
     child_id = child.id
+    {_spec, pid} = Map.fetch!(state.local_processes, child_id)
 
     reply =
       Horde.ProcessesSupervisor.terminate_child_by_id(
@@ -744,13 +1012,25 @@ defmodule Horde.DynamicSupervisorImpl do
         child_id
       )
 
-    new_state =
-      Map.put(state, :processes_by_id, delete_item(state.processes_by_id, child_id))
-      |> Map.put(:local_process_count, state.local_process_count - 1)
-
-    DeltaCrdt.delete(crdt_name(state.name), {:process, child_id}, :infinity)
+    new_state = forget_local_process(state, child_id)
+    Horde.DynamicSupervisorCrdt.drop_owned(crdt_name(state.name), child_id, pid)
 
     {reply, new_state}
+  end
+
+  defp forget_local_process(state, id) do
+    {local, remaining} = Map.pop(state.local_processes, id)
+
+    case {local, get_item(state.processes_by_id, id)} do
+      {{_spec, pid}, {_member, _recorded_spec, pid}} ->
+        delete_item(state.processes_by_id, id)
+        delete_item(state.process_pid_to_id, pid)
+
+      _ ->
+        :ok
+    end
+
+    %{state | local_processes: remaining, local_process_count: map_size(remaining)}
   end
 
   defp add_child(child, state) do
@@ -798,5 +1078,10 @@ defmodule Horde.DynamicSupervisorImpl do
 
   defp members(state) do
     Map.take(state.members_info, Map.keys(state.members))
+    |> Map.new(fn {name, member} ->
+      if Map.has_key?(state.unavailable_members, name),
+        do: {name, %{member | status: :dead}},
+        else: {name, member}
+    end)
   end
 end

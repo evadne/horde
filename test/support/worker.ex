@@ -29,10 +29,6 @@ defmodule Worker do
 
   def start_link(name) do
     GenServer.start_link(__MODULE__, name, name: via_tuple(name))
-    |> case do
-      {:error, {:already_started, _pid}} -> :ignore
-      result -> result
-    end
   end
 
   def init(name) do
