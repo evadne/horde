@@ -33,6 +33,45 @@ defmodule Horde.DynamicSupervisor do
   Older peers can reply through the relay, but do not report subsequent forwarding
   to it. Monitoring every hop therefore requires upgrading all cluster members.
 
+  ## Reachability and recovery
+
+  Membership is the intended set configured through `Horde.Cluster`; a local
+  connection failure does not administratively remove a member from that set.
+  A member's monitor failure is local to the observer. It does not publish a
+  cluster-wide declaration that the remote supervisor has died. This matters
+  when two members cannot reach each other but remain connected through a third
+  member. Local placement and quorum decisions exclude unreachable members;
+  reconnection or a new supervisor incarnation restores their eligibility.
+
+  Each supervisor publishes its direct observations, tagged with supervisor PIDs.
+  Before taking over an unreachable owner's children, Horde follows the reachable
+  observers' valid observation paths. Thus A--B--C can retain C's children through
+  B's observation without requiring A--C connectivity. A disconnected component's
+  stale observations cannot keep itself reachable. These observations are eventual
+  evidence, not a failure detector with consensus or a guarantee of one live copy.
+  Disconnected components can each recover children. Quorum strategies still
+  receive the directly reachable local view, not the indirect witness closure.
+
+  Failed local takeover attempts retain the previous child specification and
+  retry at a bounded interval. Successful starts replace that record. A child
+  returning `:ignore` deliberately declines recovery and retires the record;
+  applications must return `{:error, {:already_started, pid}}` rather than
+  translating a duplicate start into `:ignore` when recovery must remain pending.
+  Horde does not adopt that existing PID into the local supervisor.
+
+  Takeover preserves the logical child ID. Local ownership intent survives a
+  conflicting replicated record, and lifecycle cleanup removes only the departing
+  PID's contribution. A still-live local child restores a missing record without
+  continually overriding another live owner's record. Registry conflict handling
+  must terminate the losing named process; the supervisor does not deduplicate
+  unnamed children or elect a winner independently of the application's naming
+  mechanism. Intent is retired on deliberate termination, relinquishment or exit.
+
+  Owner lifecycle records include the supervisor PID to distinguish restarts
+  on the same node. Older peers can read the additional field, but still publish
+  global death claims themselves. The local-observation guarantee therefore
+  requires upgrading all members before relying on overlapping connectivity.
+
   ## Graceful shutdown
 
   When a node is stopped (either manually or by calling `:init.stop`), Horde restarts the child processes of the stopped node on another node. The state of child processes is not preserved, they are simply restarted.
@@ -210,7 +249,7 @@ defmodule Horde.DynamicSupervisor do
              sync_interval: flags.delta_crdt_options.sync_interval,
              max_sync_size: flags.delta_crdt_options.max_sync_size,
              shutdown: flags.delta_crdt_options.shutdown,
-             crdt: DeltaCrdt.AWLWWMap,
+             crdt: Horde.DynamicSupervisorCrdt,
              on_diffs: {Horde.DynamicSupervisorImpl, :on_diffs, [name]},
              name: crdt_name(name)
            ]},
@@ -286,6 +325,28 @@ defmodule Horde.DynamicSupervisor do
   This function delegates to all supervisors in the cluster and returns the aggregated output. Where memory warnings apply to `DynamicSupervisor.which_children`, these count double for `Horde.DynamicSupervisor.which_children`.
   """
   def which_children(supervisor), do: call(supervisor, :which_children)
+
+  @doc """
+  Returns this member's accepted local ownership intent as `{child_id, pid, child_spec}` tuples.
+
+  This bounded diagnostic reads local supervision bookkeeping without calling
+  the underlying processes supervisor. It is not an atomic cluster-wide
+  snapshot or proof that every recorded process is still alive.
+  """
+  def local_processes(supervisor, timeout \\ 5_000),
+    do: GenServer.call(supervisor, :local_processes, timeout)
+
+  @doc """
+  Returns replicated child records currently naming this supervisor as owner.
+
+  The `{child_id, pid, child_spec}` tuples may temporarily differ from
+  `local_processes/2`, which records this supervisor's accepted local ownership
+  intent independently of CRDT conflict resolution. Neither diagnostic queries
+  the underlying processes supervisor. Compare both with actual children only
+  after allowing for in-flight lifecycle changes; these are separate snapshots.
+  """
+  def local_process_records(supervisor, timeout \\ 5_000),
+    do: GenServer.call(supervisor, :local_process_records, timeout)
 
   @doc """
   Works like `DynamicSupervisor.count_children/1`.
