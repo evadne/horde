@@ -62,7 +62,9 @@ defmodule Horde.DynamicSupervisor do
   Takeover preserves the logical child ID. Local ownership intent survives a
   conflicting replicated record, and lifecycle cleanup removes only the departing
   PID's contribution. A still-live local child restores a missing record without
-  continually overriding another live owner's record. Registry conflict handling
+  continually overriding another live owner's record. It also restores ownership
+  if a replacement disappears before publishing its cleanup, even when another
+  member would be selected to start a new copy. Registry conflict handling
   must terminate the losing named process; the supervisor does not deduplicate
   unnamed children or elect a winner independently of the application's naming
   mechanism. Intent is retired on deliberate termination, relinquishment or exit.
