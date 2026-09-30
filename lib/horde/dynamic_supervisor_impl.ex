@@ -509,10 +509,10 @@ defmodule Horde.DynamicSupervisorImpl do
 
     (processes || all_items_values(state.processes_by_id))
     |> Enum.reduce(state, fn {current_node, child_spec, _child_pid}, state ->
+      {state, current_node} = restore_existing_local_owner(state, current_node, child_spec)
+
       case choose_node(child_spec, state) do
         {:ok, %{name: chosen_node}} ->
-          current_member = Map.get(members(state), current_node)
-
           case {current_node, chosen_node} do
             {same_node, same_node} ->
               # process is running on the node on which it belongs
@@ -533,9 +533,7 @@ defmodule Horde.DynamicSupervisorImpl do
             {_current_node, ^this_node} ->
               # process is running on another node but belongs here
 
-              if is_nil(current_member) or
-                   (match?(%{status: :dead}, current_member) and
-                      not MapSet.member?(observed_reachable_members(state), current_node)) do
+              if owner_unreachable?(state, current_node) do
                 if retry? or not Map.has_key?(state.pending_recoveries, child_spec.id) do
                   recover_child(child_spec, state)
                 else
@@ -556,6 +554,31 @@ defmodule Horde.DynamicSupervisorImpl do
       end
     end)
     |> schedule_recovery_retry()
+  end
+
+  defp owner_unreachable?(state, owner) do
+    case Map.get(members(state), owner) do
+      nil -> true
+      %{status: :dead} -> not MapSet.member?(observed_reachable_members(state), owner)
+      _ -> false
+    end
+  end
+
+  defp restore_existing_local_owner(state, owner, child_spec) do
+    this_node = fully_qualified_name(state.name)
+
+    case Map.get(state.local_processes, child_spec.id) do
+      {local_spec, pid} when owner != this_node ->
+        # A replacement can disappear before publishing its losing copy's
+        # cleanup. Preserve the already-live original even when some third
+        # member would be selected to start a new copy of this specification.
+        if Process.alive?(pid) and owner_unreachable?(state, owner),
+          do: {update_state_with_child(local_spec, pid, state), this_node},
+          else: {state, owner}
+
+      _ ->
+        {state, owner}
+    end
   end
 
   defp recover_child(child_spec, state) do

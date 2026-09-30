@@ -38,6 +38,42 @@ defmodule Horde.DynamicSupervisorRecoveryTest do
     assert Process.whereis(worker_name) == replacement
   end
 
+  test "a live local copy restores ownership when the recorded replacement dies before cleanup" do
+    suffix = System.unique_integer([:positive])
+    names = [a, b, c] = for letter <- ~w(a b c), do: :"orphan_#{letter}_#{suffix}"
+    dead_owner_root = start_horde(a, [a])
+    start_horde(b, [b])
+    start_horde(c, [c])
+    gate = start_supervised!({Agent, fn -> :run end})
+    name = :"orphan_worker_#{suffix}"
+    spec = %{id: :original, start: {NamedWorker, :start_link, [{name, self(), gate}]}}
+    assert {:ok, original} = Horde.DynamicSupervisor.start_child(c, spec)
+    for horde <- names, do: Horde.Cluster.set_members(horde, names)
+    await(fn -> Enum.all?(names, &(map_size(:sys.get_state(&1).name_to_supervisor_ref) == 3)) end)
+    [{id, ^original, child_spec}] = Horde.DynamicSupervisor.local_processes(c)
+
+    # Model the independently selected replacement contribution. Registry still
+    # names C's live original; A then disappears without sending child cleanup.
+    replacement_record = {{a, node()}, child_spec, Process.whereis(a)}
+    DeltaCrdt.put(:"#{a}.Crdt", {:process, id}, replacement_record)
+
+    await(fn ->
+      Enum.all?(names, &(Support.snapshot(&1).records == [{id, replacement_record}]))
+    end)
+
+    Process.exit(dead_owner_root, :kill)
+
+    await(fn ->
+      Enum.all?([b, c], fn horde ->
+        match?([{^id, {{^c, _}, _, ^original}}], Support.snapshot(horde).records)
+      end)
+    end)
+
+    assert Process.whereis(name) == original
+    assert Horde.DynamicSupervisor.local_processes(b) == []
+    assert Support.snapshot(b).pending == %{}
+  end
+
   test "a deliberate ignore retires the recovery obligation" do
     {first, owner, owner_root, worker_name, gate} = local_pair()
     spec = %{id: :ignored, start: {NamedWorker, :start_link, [{worker_name, self(), gate}]}}
