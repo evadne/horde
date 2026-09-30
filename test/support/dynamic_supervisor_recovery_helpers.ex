@@ -86,3 +86,9 @@ defmodule Horde.RecoveryTest.Support do
     :sys.get_state(TestReg.Crdt).neighbours
   end
 end
+
+defmodule Horde.RecoveryTest.UnnamedWorker do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil)
+  def init(_), do: {:ok, nil}
+end

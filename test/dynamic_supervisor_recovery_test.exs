@@ -333,6 +333,79 @@ defmodule Horde.DynamicSupervisorRecoveryTest do
              Cluster.call(owner, Horde.DynamicSupervisor, :local_processes, [TestSup])
   end
 
+  test "unnamed copies retain local intent without fighting over the healed record" do
+    peers = [first, owner] = start_peers(~w(a c))
+
+    assert {:ok, original} =
+             Cluster.call(owner, Horde.DynamicSupervisor, :start_child, [
+               TestSup,
+               {Horde.RecoveryTest.UnnamedWorker, nil}
+             ])
+
+    for peer <- peers do
+      :ok =
+        Cluster.call(peer, Horde.Cluster, :set_members, [
+          TestSup,
+          Enum.map(peers, &{TestSup, &1.node})
+        ])
+    end
+
+    Cluster.await_supervised(peers, [original])
+    true = Cluster.call(first, :erlang, :set_cookie, [owner.node, :unnamed_cut])
+    true = Cluster.call(owner, :erlang, :set_cookie, [first.node, :unnamed_cut_other])
+    true = Cluster.call(first, Node, :disconnect, [owner.node])
+
+    await(fn ->
+      length(Cluster.call(first, Horde.DynamicSupervisor, :local_processes, [TestSup])) == 1
+    end)
+
+    [{id, replacement, _}] =
+      Cluster.call(first, Horde.DynamicSupervisor, :local_processes, [TestSup])
+
+    assert replacement != original
+
+    for peer <- peers do
+      other = if peer == first, do: owner, else: first
+      true = Cluster.call(peer, :erlang, :set_cookie, [other.node, Node.get_cookie()])
+    end
+
+    await(fn -> Cluster.call(first, Node, :connect, [owner.node]) end)
+
+    await(fn ->
+      snapshots = Enum.map(peers, &Cluster.call(&1, Support, :snapshot, [TestSup]))
+
+      Enum.all?(snapshots, &(&1.unavailable == %{})) and
+        length(Enum.uniq(Enum.map(snapshots, & &1.records))) == 1
+    end)
+
+    records = Cluster.call(first, Support, :snapshot, [TestSup]).records
+    Process.sleep(1_100)
+    assert Enum.all?(peers, &(Cluster.call(&1, Support, :snapshot, [TestSup]).records == records))
+
+    assert [{^id, ^original, _}] =
+             Cluster.call(owner, Horde.DynamicSupervisor, :local_processes, [TestSup])
+
+    assert [{^id, ^replacement, _}] =
+             Cluster.call(first, Horde.DynamicSupervisor, :local_processes, [TestSup])
+
+    assert Cluster.call(owner, Process, :alive?, [original])
+    assert Cluster.call(first, Process, :alive?, [replacement])
+
+    # Each local copy remains explicitly terminable, including the copy whose
+    # PID is not the CRDT winner. Its cleanup must leave the other copy intact.
+    assert :ok =
+             Cluster.call(owner, Horde.DynamicSupervisor, :terminate_child, [TestSup, original])
+
+    assert Cluster.call(first, Process, :alive?, [replacement])
+
+    assert :ok =
+             Cluster.call(first, Horde.DynamicSupervisor, :terminate_child, [TestSup, replacement])
+
+    await(fn ->
+      Enum.all?(peers, &(Cluster.call(&1, Support, :snapshot, [TestSup]).records == []))
+    end)
+  end
+
   test "witness paths cross several observers but stale detached views do not prevent failover" do
     peers = [a, b, c, d] = start_peers(~w(a b c d))
 
