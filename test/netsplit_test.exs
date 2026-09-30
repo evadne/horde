@@ -38,6 +38,8 @@ defmodule NetSplitTest do
             end
           end)
         end)
+
+        await_exact_ownership(group, names)
       end
     rescue
       error in ExUnit.AssertionError ->
@@ -59,7 +61,14 @@ defmodule NetSplitTest do
     Cluster.heal(peers)
     await_names(peers, names)
 
-    Cluster.await("exactly one supervised worker per name after healing", fn ->
+    await_exact_ownership(peers, names)
+
+    assert identities ==
+             Enum.map(peers, &Cluster.call(&1, Process, :whereis, [TestApp.Supervisor]))
+  end
+
+  defp await_exact_ownership(peers, names) do
+    Cluster.await("actual workers, registrations and every replica's records agree", fn ->
       children =
         Enum.flat_map(peers, fn peer ->
           Cluster.call(peer, Horde.ProcessesSupervisor, :which_children, [
@@ -67,12 +76,15 @@ defmodule NetSplitTest do
           ])
         end)
 
-      registered = Enum.map(names, &lookup(first, &1))
-      Enum.sort(Enum.map(children, &elem(&1, 1))) == Enum.sort(registered)
-    end)
+      registered = Enum.map(names, &lookup(hd(peers), &1)) |> Enum.sort()
+      actual = Enum.map(children, &elem(&1, 1)) |> Enum.sort()
 
-    assert identities ==
-             Enum.map(peers, &Cluster.call(&1, Process, :whereis, [TestApp.Supervisor]))
+      actual == registered and
+        Enum.all?(peers, fn peer ->
+          recorded = Cluster.call(peer, Cluster, :supervised_pids, [TestSup]) |> Enum.sort()
+          recorded == actual
+        end)
+    end)
   end
 
   defp lookup(peer, name),
