@@ -20,7 +20,13 @@ defmodule Horde.ProxyOperationTest do
     reply_tag = make_ref()
     :ok = Horde.ProxyOperation.forward(destination, :request, {self(), reply_tag}, :infinity)
     assert_receive {:delivered, ^destination, {:proxy_operation, :request, relay_from}}
-    {reply_tag, relay_from, Process.monitor(elem(relay_from, 0))}
+    relay = elem(relay_from, 0)
+    monitor = Process.monitor(relay)
+    # Confirm installation before another process can make the relay exit.
+    # Observing only the ref can otherwise race with that exit and yield :noproc.
+    assert {:monitored_by, observers} = Process.info(relay, :monitored_by)
+    assert self() in observers
+    {reply_tag, relay_from, monitor}
   end
 
   test "returns an uncertain error when the destination dies before replying" do
