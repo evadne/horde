@@ -28,6 +28,7 @@ defmodule Horde.DynamicSupervisorImpl do
             pending_recoveries: %{},
             recovery_retry_timer: nil,
             shutting_down: false,
+            processes_supervisor_ready: false,
             supervisor_options: [],
             proxy_message_ttl: :infinity,
             proxy_operation_ttl: nil,
@@ -62,7 +63,7 @@ defmodule Horde.DynamicSupervisorImpl do
       }
       |> Map.merge(Map.new(Keyword.take(options, [:distribution_strategy, :proxy_message_ttl])))
 
-    state = set_own_node_status(state)
+    state = load_initial_state(state)
 
     {:ok, state, {:continue, {:set_members, Keyword.get(options, :members)}}}
   end
@@ -73,13 +74,31 @@ defmodule Horde.DynamicSupervisorImpl do
     state =
       state.name
       |> Horde.NodeListener.make_members()
-      |> set_members(state)
+      |> set_initial_members(state)
 
     {:noreply, state}
   end
 
   def handle_continue({:set_members, members}, state) do
-    {:noreply, set_members(members, state)}
+    {:noreply, set_initial_members(members, state)}
+  end
+
+  defp set_initial_members(members, state) do
+    # Peers can already have seeded the CRDT before this implementation starts.
+    # Constructor membership is additive; explicit set_members remains replacing.
+    set_members(
+      Enum.uniq(Enum.map(members, &fully_qualified_name/1) ++ Map.keys(state.members)),
+      state
+    )
+  end
+
+  defp load_initial_state(state) do
+    diffs =
+      Enum.map(DeltaCrdt.to_map(crdt_name(state.name), :infinity), fn {key, value} ->
+        {:add, key, value}
+      end)
+
+    state |> update_members(diffs) |> set_own_node_status() |> update_processes(diffs)
   end
 
   def on_diffs(name, diffs) do
@@ -100,8 +119,9 @@ defmodule Horde.DynamicSupervisorImpl do
     }
   end
 
-  defp node_status(%{shutting_down: false}), do: :alive
   defp node_status(%{shutting_down: true}), do: :shutting_down
+  defp node_status(%{processes_supervisor_ready: false}), do: :uninitialized
+  defp node_status(_state), do: :alive
 
   @doc false
   def handle_call(:horde_shutting_down, _f, state) do
@@ -244,6 +264,46 @@ defmodule Horde.DynamicSupervisorImpl do
 
     {:reply, count, state}
   end
+
+  def handle_cast(
+        {:processes_supervisor_ready, pid},
+        %{processes_supervisor_ready: false, shutting_down: false} = state
+      ) do
+    if Process.whereis(supervisor_name(state.name)) == pid do
+      # Refresh once before publishing readiness. Notifications sent before this
+      # process existed may have been dropped, and others can still be queued.
+      state = load_initial_state(state)
+      state = %{state | processes_supervisor_ready: true}
+
+      state =
+        state
+        |> set_own_node_status()
+        |> monitor_supervisors()
+        |> publish_observation()
+        |> handle_quorum_change()
+
+      # Records from an earlier local incarnation do not prove that this new
+      # local supervisor owns a child. Relinquish them conditionally, preserving
+      # their specifications for ordinary placement without adopting old PIDs.
+      owner = fully_qualified_name(state.name)
+
+      for {^owner, spec, old_pid} <- all_items_values(state.processes_by_id),
+          not Map.has_key?(state.local_processes, spec.id) do
+        Horde.DynamicSupervisorCrdt.relinquish_owned(
+          crdt_name(state.name),
+          spec.id,
+          old_pid,
+          spec
+        )
+      end
+
+      {:noreply, handoff_processes(state)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_cast({:processes_supervisor_ready, _pid}, state), do: {:noreply, state}
 
   def handle_cast({:update_child_pid, child_id, new_pid}, state) do
     {:noreply, set_child_pid(state, child_id, new_pid)}
@@ -460,8 +520,22 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   def handle_info({:crdt_update, diffs}, state) do
+    # Notifications can predate bootstrap or a newer local lifecycle operation.
+    # Reconcile only their keys against the current CRDT, never replay old values.
+    keys = Enum.map(diffs, &elem(&1, 1)) |> Enum.uniq()
+    current = DeltaCrdt.take(crdt_name(state.name), keys, :infinity)
+
+    diffs =
+      Enum.map(keys, fn key ->
+        case Map.fetch(current, key) do
+          {:ok, value} -> {:add, key, value}
+          :error -> {:remove, key}
+        end
+      end)
+
     new_state =
       update_members(state, diffs)
+      |> set_own_node_status()
       |> update_processes(diffs)
 
     new_state =
@@ -507,7 +581,14 @@ defmodule Horde.DynamicSupervisorImpl do
 
   def has_membership_changed?([]), do: false
 
-  defp handoff_processes(state, retry? \\ false, processes \\ nil) do
+  defp handoff_processes(state, retry? \\ false, processes \\ nil)
+
+  defp handoff_processes(%{processes_supervisor_ready: false} = state, _retry?, _processes),
+    do: state
+
+  defp handoff_processes(%{shutting_down: true} = state, _retry?, _processes), do: state
+
+  defp handoff_processes(state, retry?, processes) do
     this_node = fully_qualified_name(state.name)
 
     (processes || all_items_values(state.processes_by_id))
@@ -583,6 +664,9 @@ defmodule Horde.DynamicSupervisorImpl do
         {state, owner}
     end
   end
+
+  defp recover_child(_spec, %{processes_supervisor_ready: false} = state), do: state
+  defp recover_child(_spec, %{shutting_down: true} = state), do: state
 
   defp recover_child(child_spec, state) do
     {_owner, _spec, previous_pid} = get_item(state.processes_by_id, child_spec.id)
@@ -702,6 +786,8 @@ defmodule Horde.DynamicSupervisorImpl do
   end
 
   defp update_process(state, _), do: state
+
+  defp restore_local_process(%{shutting_down: true} = state, _id), do: state
 
   defp restore_local_process(state, id) do
     case Map.get(state.local_processes, id) do
