@@ -126,11 +126,21 @@ the test matrix because it does not provide `:peer`.
 
 Distributed tests use `:peer` with a standard-I/O control channel. The nodes
 remain alive when Erlang distribution is disconnected, and observations and
-cleanup do not reconnect them. Partition tests give each component a different
-cookie to prevent automatic reconnection, then restore the cookies on healing.
+cleanup do not reconnect them. The two-node and four-node recovery scenarios
+keep the test manager outside the distribution network; tests that need a local
+caller explicitly retain its connection through the helper's default option.
+Partition tests give each component a different cookie to prevent automatic reconnection, then restore the cookies on healing.
 They keep `prevent_overlapping_partitions` enabled and verify the actual topology
 and process identities before checking recovery. Do not disable this protection
 in `ERL_FLAGS` or `ELIXIR_ERL_OPTIONS`; the suite rejects that configuration.
+
+Cuts are sequential, so OTP can remove working connections within the intended
+components while the split forms. The helper reconnects those components and
+verifies their final topology. This is fragmentation followed by recovery to a
+2+2 split, not an atomic network cut. Each peer records node-up/down events with
+reasons and timestamps, included in failure snapshots. Earlier failure runs
+also had the manager as a fifth visible node; removing it improves the fault
+model but does not itself demonstrate that the recovery defect is repaired.
 
 The previously skipped two-node and four-node partition scenarios are covered by
 enabled tests with bounded convergence checks. The four-node scenario uses 20
