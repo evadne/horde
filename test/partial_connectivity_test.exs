@@ -29,8 +29,17 @@ defmodule Horde.PartialConnectivityTest do
       end)
 
       names = Enum.map(1..12, &"partial-worker-#{&1}")
+      remote_name = {:on_node, c.node, "unreachable-owner"}
+      names = if @membership == :static, do: names ++ [remote_name], else: names
       for name <- names, do: assert({:ok, _} = call(a, Worker, :start, [name]))
       await_agreement(peers, names)
+
+      remote_pid =
+        if @membership == :static do
+          [{pid, nil}] = call(c, Horde.Registry, :lookup, [TestReg, remote_name])
+          assert node(pid) == c.node
+          pid
+        end
 
       true = call(a, :erlang, :set_cookie, [c.node, :blocked_from_a])
       true = call(c, :erlang, :set_cookie, [a.node, :blocked_from_c])
@@ -55,6 +64,18 @@ defmodule Horde.PartialConnectivityTest do
                  _ ->
                    true
                end)
+      end
+
+      if @membership == :static do
+        # The control call bounds the assertion at five seconds. Failure to
+        # reach the owner is uncertain: do not replay this terminate request.
+        assert {:error, {:node_dead_or_shutting_down, message}} =
+                 call(a, Horde.DynamicSupervisor, :terminate_child, [TestSup, remote_pid])
+
+        assert is_binary(message)
+        assert call(c, Process, :alive?, [remote_pid])
+        assert [{remote_pid, nil}] == call(c, Horde.Registry, :lookup, [TestReg, remote_name])
+        assert length(call(a, Horde.Cluster, :members, [TestSup])) == 3
       end
 
       true = call(a, :erlang, :set_cookie, [c.node, @cookie])

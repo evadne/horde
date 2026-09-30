@@ -1,3 +1,20 @@
+defmodule Horde.PartialConnectivity.Distribution do
+  @behaviour Horde.DistributionStrategy
+
+  def choose_node(
+        %{start: {Horde.PartialConnectivity.Worker, :start_link, [{:on_node, node, _}]}} = spec,
+        members
+      ) do
+    case Enum.find(members, &match?(%{name: {_, ^node}, status: :alive}, &1)) do
+      nil -> Horde.UniformDistribution.choose_node(spec, members)
+      member -> {:ok, member}
+    end
+  end
+
+  def choose_node(spec, members), do: Horde.UniformDistribution.choose_node(spec, members)
+  defdelegate has_quorum?(members), to: Horde.UniformDistribution
+end
+
 defmodule Horde.PartialConnectivity.Worker do
   use GenServer
 
@@ -33,6 +50,7 @@ defmodule Horde.PartialConnectivity.Support do
       {Horde.DynamicSupervisor,
        name: TestSup,
        strategy: :one_for_one,
+       distribution_strategy: Horde.PartialConnectivity.Distribution,
        members: membership,
        delta_crdt_options: [sync_interval: 20]}
     ]
