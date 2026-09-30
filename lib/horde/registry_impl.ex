@@ -141,17 +141,20 @@ defmodule Horde.RegistryImpl do
       :infinity
     )
 
-    Enum.each(members, fn member ->
-      :ets.insert(state.members_ets_table, {member, 1})
-    end)
+    # Replication can populate the CRDT before this named process exists, so
+    # its first notifications may have had no recipient. An equal-value merge
+    # emits no replacement diffs: materialise the authoritative snapshot here.
+    # Membership comes first; normal reconciliation reads current CRDT values
+    # again so queued changes cannot revive an obsolete registration.
+    initial_diffs =
+      DeltaCrdt.to_map(crdt_name(state.name))
+      |> Enum.sort_by(fn
+        {{:member, _}, _} -> 0
+        _ -> 1
+      end)
+      |> Enum.map(fn {key, value} -> {:add, key, value} end)
 
-    neighbours =
-      List.delete(members, [fully_qualified_name(state.name)])
-      |> crdt_names()
-
-    send(crdt_name(state.name), {:set_neighbours, neighbours})
-
-    %{state | nodes: Enum.map(members, fn {_name, node} -> node end) |> MapSet.new()}
+    process_diffs(state, initial_diffs)
   end
 
   defp process_diffs(state, [diff | diffs]) do
