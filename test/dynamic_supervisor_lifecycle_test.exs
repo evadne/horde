@@ -70,6 +70,46 @@ defmodule Horde.DynamicSupervisorLifecycleTest do
     assert Process.whereis(name) == impl
   end
 
+  test "a peer recovers earlier records when an uninitialised supervisor dies on a live node" do
+    suffix = System.unique_integer([:positive])
+    first = :"early_a_#{suffix}"
+    owner = :"early_z_#{suffix}"
+
+    start_supervised!(
+      {Horde.DynamicSupervisor,
+       name: first, strategy: :one_for_one, distribution_strategy: FirstMemberDistribution}
+    )
+
+    start_crdt(owner)
+    old_pid = spawn(fn -> :ok end)
+    ref = Process.monitor(old_pid)
+    assert_receive {:DOWN, ^ref, :process, ^old_pid, _}
+    spec = %{id: :earlier_owner, start: {UnnamedWorker, :start_link, [nil]}}
+
+    DeltaCrdt.merge(crdt(owner), %{
+      {:member, {first, node()}} => 1,
+      {:member, {owner, node()}} => 1,
+      {:process, spec.id} => {{owner, node()}, spec, old_pid}
+    })
+
+    impl = start_impl(owner)
+    :ok = Horde.Cluster.set_members(first, [first, owner])
+
+    await(fn ->
+      case :sys.get_state(first).members_info[{owner, node()}] do
+        %{status: :uninitialized, pid: ^impl} -> true
+        _ -> false
+      end
+    end)
+
+    assert Horde.DynamicSupervisor.local_processes(first) == []
+    Process.exit(impl, :kill)
+
+    await(fn ->
+      match?([{:earlier_owner, _, _}], Horde.DynamicSupervisor.local_processes(first))
+    end)
+  end
+
   test "shutdown never restarts relinquished children after the processes supervisor stops" do
     name = unique_name()
     root = start_supervised!({Horde.DynamicSupervisor, name: name, strategy: :one_for_one})

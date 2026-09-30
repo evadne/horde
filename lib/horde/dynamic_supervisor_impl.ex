@@ -979,6 +979,12 @@ defmodule Horde.DynamicSupervisorImpl do
         {name, %{status: :alive} = member} ->
           [{name, Map.get(member, :pid) || name}]
 
+        {name, %{status: :uninitialized, pid: pid}} when is_pid(pid) ->
+          # A startup failure can leave the BEAM connected. Observe this known
+          # incarnation so earlier child obligations still fail over if it dies;
+          # :uninitialized remains ineligible for placement until readiness.
+          [{name, pid}]
+
         _ ->
           []
       end)
