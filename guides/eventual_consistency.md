@@ -11,7 +11,9 @@ This can happen:
 - when a node dies and not all nodes have the same view of the cluster, or
 - if there is a network partition.
 
-Once a network partition has healed, Horde will automatically terminate any duplicate processes.
+After a partition heals, `Horde.Registry` resolves competing registrations and sends an exit signal to the losing named process. `Horde.DynamicSupervisor` does not independently choose which live copy to terminate: the two components could otherwise choose opposite winners and kill both. Since Horde 0.6, fresh child starts ignore the caller's child-specification ID. The private logical ID retained across takeover tracks recovery; it is not an application uniqueness guarantee. Unnamed copies can remain alive after healing.
+
+A member retains its local supervision intent even if the replicated record temporarily selects another copy. Missing records, or records whose replacement owner has become unreachable without any valid witness, can be restored from a live local copy. A reachable competing owner is not continually overwritten. This preserves recovery information while allowing Registry conflict handling to retire the losing named worker.
 
 ## Horde.Registry merge conflict
 
@@ -33,28 +35,26 @@ end
 
 Note that, unless your process has `restart: :transient` in its child spec and you have handled the message to shut down the process cleanly, it will be restarted by its supervisor.
 
-Upon restart, it will try to register itself. This will of course fail. If using a via tuple, the following approach is necessary.
+If a recovery attempt encounters the existing registered process, return the ordinary start error unchanged:
 
 ```elixir
 def start_link(arg) do
-  case GenServer.start_link(...) do
-    {:ok, pid} ->
-      {:ok, pid}
-    {:error, {:already_started, pid}} ->
-      :ignore
-  end
+  GenServer.start_link(__MODULE__, arg, name: via_tuple(arg))
 end
 ```
 
-If you are using `Horde.Registry.register/3` in `init/1`, then you must handle `{:error, {:already_registered, pid}}`.
+`{:error, {:already_started, pid}}` keeps the recovery obligation pending; Horde does not adopt that PID into another local supervisor. Returning `:ignore` deliberately declines the child and retires that recovery obligation. Do not translate a duplicate error into `:ignore` if recovery must remain possible after the current owner disappears.
+
+If you call `Horde.Registry.register/3` inside `init/1`, return a failed start when the name is already registered:
 
 ```elixir
 def init(arg) do
   case Horde.Registry.register(:my_registry, "key", "value") do
     {:ok, _pid} ->
       {:ok, arg}
-    {:error, {:already_registered, _pid}} ->
-      :ignore
+
+    {:error, {:already_registered, pid}} ->
+      {:stop, {:already_registered, pid}}
   end
 end
 ```

@@ -130,9 +130,12 @@ cleanup do not reconnect them. The two-node and four-node recovery scenarios
 keep the test manager outside the distribution network; tests that need a local
 caller explicitly retain its connection through the helper's default option.
 Partition tests give each component a different cookie to prevent automatic reconnection, then restore the cookies on healing.
-They keep `prevent_overlapping_partitions` enabled and verify the actual topology
-and process identities before checking recovery. Do not disable this protection
-in `ERL_FLAGS` or `ELIXIR_ERL_OPTIONS`; the suite rejects that configuration.
+The original full-partition scenarios keep `prevent_overlapping_partitions`
+enabled and verify actual topology and process identities before checking
+recovery. Separate partial-connectivity tests explicitly disable it on their
+private peer nodes to exercise overlapping views while retaining healthy links.
+Do not disable protection globally in `ERL_FLAGS` or `ELIXIR_ERL_OPTIONS`; the
+suite rejects that configuration so each scenario controls its own fault model.
 
 Cuts are sequential, so OTP can remove working connections within the intended
 components while the split forms. The helper reconnects those components and
@@ -150,19 +153,46 @@ and registry-conflict protocol. These tests distinguish a surviving partition
 from node death; they do not promise single ownership during a partition or
 exhaustively explore every network failure.
 
-### Known recovery failure exposed by the enabled suite
+### Recovery defects exposed by the enabled suite
 
-The four-node test remains capable of failing during partition formation, with
-some supervisor child records missing and registry entries pointing to the other
-component after the topology has settled. CI run
+The earlier four-node test failed during partition formation, leaving missing
+supervisor records and registry entries pointing into another component after
+the topology settled. Historical CI run
 [36640977093](https://github.com/evadne/horde/actions/runs/36640977093) captured
-this on OTP 25, 26, 28 and 29. The owner-specific registry cleanup repair addresses
-a separately reproduced deletion race; it does not establish that this broader
-recovery failure is fixed. Failed tests print each peer's topology, membership,
-children and CRDT registrations for diagnosis. The assertion stays enabled.
+failures on OTP 25, 26, 28 and 29. A later green run does not invalidate that
+evidence. Subsequent deterministic regressions identified these mechanisms:
 
-Local passing runs and a subsequent green matrix do not invalidate that evidence.
-Partition formation can involve intermediate disconnections and concurrent child
-replacement; the precise loss mechanism still needs a deterministic reproduction.
-Do not interpret this integration branch as establishing complete partition
-recovery or as production rollout approval.
+- A failed takeover deleted the original specification before knowing whether
+  the replacement started. Failed starts now retain a bounded retry obligation;
+  deliberate `:ignore` still declines recovery.
+- A successful takeover could replace the supervision record, then lose a
+  separate Registry conflict to the original live worker. Stable takeover IDs,
+  local ownership intent and PID-specific cleanup preserve that original's
+  bookkeeping. A live local copy can also restore ownership if the replacement
+  disappears before publishing cleanup.
+- Replicated global death claims made observers with overlapping connectivity
+  contradict each other. PID-scoped direct observations now defer takeover while
+  a reachable observation path still witnesses the owner. Disconnected components
+  can still recover independently; this is not consensus or exactly-once execution.
+- Removing and rejoining a Registry member could lose a live local registration.
+  Registry retains registration intent, respects explicit unregister/death and
+  retires conflict losers. Its initial state is also reconciled with an already
+  populated CRDT, rather than relying on an initial callback that may precede
+  Registry startup.
+
+The strengthened four-node test compares the exact actual worker PID set with
+every replica's supervision records and registered names inside stable split
+components and again after healing. Partial-connectivity tests verify healthy
+links remain connected, worker starts settle, operations fail promptly across a
+cut, and exact ownership recovers after healing and actual owner death. Focused
+regressions cover lost cleanup, independently selected Registry/supervisor
+winners, multi-hop witness paths, restart incarnations and stale detached views.
+Unnamed copies are not independently deduplicated by DynamicSupervisor; their
+local intent remains observable and explicitly terminable, without continually
+rewriting a reachable competing owner's record.
+
+These tests remain enabled and print topology, membership, actual children and
+replicated state on failure. They qualify specific failure models and lifecycle
+orderings, not every network schedule. Mixed older/newer peers do not provide the
+new observation and ownership guarantees until all members are upgraded. Passing
+local tests or a CI matrix is not production rollout approval.
