@@ -180,6 +180,13 @@ evidence. Subsequent deterministic regressions identified these mechanisms:
   populated CRDT, rather than relying on an initial callback that may precede
   Registry startup.
 
+- Recovery could run after the supervisor implementation advertised itself alive
+  but before its local processes supervisor existed. Members now remain
+  uninitialised until that child finishes initialisation. Startup materialises
+  preseeded supervision records, preserves seeded peers, and handles earlier
+  local incarnations without adopting their PIDs. Current-key reconciliation
+  rejects stale queued callbacks, and shutdown prevents new local recovery.
+
 The strengthened four-node test compares the exact actual worker PID set with
 every replica's supervision records and registered names inside stable split
 components and again after healing. Partial-connectivity tests verify healthy

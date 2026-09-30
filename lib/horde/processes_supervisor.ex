@@ -609,8 +609,12 @@ defmodule Horde.ProcessesSupervisor do
         state = %Horde.ProcessesSupervisor{mod: mod, args: init_arg, name: name}
 
         case init(state, flags) do
-          {:ok, state} -> {:ok, state}
-          {:error, reason} -> {:stop, {:supervisor_data, reason}}
+          {:ok, state} ->
+            GenServer.cast(state.root_name, {:processes_supervisor_ready, self()})
+            {:ok, state}
+
+          {:error, reason} ->
+            {:stop, {:supervisor_data, reason}}
         end
 
       :ignore ->

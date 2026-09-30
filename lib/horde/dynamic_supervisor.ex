@@ -83,6 +83,13 @@ defmodule Horde.DynamicSupervisor do
   global death claims themselves. The local-observation guarantee therefore
   requires upgrading all members before relying on overlapping connectivity.
 
+  A starting member stays `:uninitialized` until its local processes supervisor
+  completes initialisation. Startup materialises already-replicated records and
+  preserves discovered peers; specifications from an earlier local incarnation
+  return to normal placement without adopting unsupervised PIDs. Queued CRDT
+  notifications reconcile their current keys instead of replaying stale values.
+  Once shutdown begins, incoming recovery work cannot start new local children.
+
   ## Graceful shutdown
 
   When a node is stopped (either manually or by calling `:init.stop`), Horde restarts the child processes of the stopped node on another node. The state of child processes is not preserved, they are simply restarted.
