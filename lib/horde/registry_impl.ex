@@ -7,6 +7,8 @@ defmodule Horde.RegistryImpl do
 
   defmodule State do
     @moduledoc false
+    # Local intent outlives replicated visibility, but never its owner or an
+    # explicit unregister/resolved conflict. It is not a replicated membership claim.
     defstruct name: nil,
               nodes: MapSet.new(),
               members: MapSet.new(),
@@ -14,6 +16,7 @@ defmodule Horde.RegistryImpl do
               pids_ets_table: nil,
               keys_ets_table: nil,
               members_ets_table: nil,
+              local_registrations: %{},
               listeners: []
   end
 
@@ -113,21 +116,18 @@ defmodule Horde.RegistryImpl do
   end
 
   def handle_info({:EXIT, pid, _reason}, state) do
-    case :ets.take(state.pids_ets_table, pid) do
-      [{_pid, keys}] ->
-        Horde.RegistryCrdt.drop_owned(crdt_name(state.name), keys, pid)
+    retained_keys = for {key, {^pid, _value}} <- state.local_registrations, do: key
+    state = %{state | local_registrations: Map.drop(state.local_registrations, retained_keys)}
 
-        Enum.each(keys, fn key ->
-          :ets.match_delete(state.keys_ets_table, {key, :_, {pid, :_}})
+    visible_keys =
+      case :ets.take(state.pids_ets_table, pid) do
+        [{_pid, keys}] -> keys
+        [] -> []
+      end
 
-          for listener <- state.listeners do
-            send(listener, {:unregister, state.name, key, pid})
-          end
-        end)
-
-      _ ->
-        nil
-    end
+    keys = Enum.uniq(retained_keys ++ visible_keys)
+    Horde.RegistryCrdt.drop_owned(crdt_name(state.name), keys, pid)
+    Enum.each(keys, &unregister_local(state, &1, pid))
 
     {:noreply, state}
   end
@@ -162,6 +162,39 @@ defmodule Horde.RegistryImpl do
   defp process_diffs(state, []), do: state
 
   defp process_diff(state, {:add, {:member, member}, 1}) do
+    reconcile_member(state, member)
+  end
+
+  defp process_diff(state, {:remove, {:member, member}}) do
+    reconcile_member(state, member)
+  end
+
+  defp process_diff(state, {:remove, {:registry, key}}) do
+    :ets.delete(state.name, key)
+    state
+  end
+
+  defp process_diff(state, {:add, {:key, key}, _registration}) do
+    reconcile_registration(state, key)
+  end
+
+  defp process_diff(state, {:remove, {:key, key}}) do
+    reconcile_registration(state, key)
+  end
+
+  defp process_diff(state, {:add, {:registry, key}, value}) do
+    :ets.insert(state.registry_ets_table, {key, value})
+    state
+  end
+
+  defp reconcile_member(state, member) do
+    case DeltaCrdt.get(crdt_name(state.name), {:member, member}) do
+      1 -> add_member(state, member)
+      nil -> remove_member(state, member)
+    end
+  end
+
+  defp add_member(state, member) do
     new_members = MapSet.put(state.members, member)
 
     :ets.insert(state.members_ets_table, {member, 1})
@@ -175,18 +208,15 @@ defmodule Horde.RegistryImpl do
     new_nodes = Enum.map(new_members, fn {_name, node} -> node end) |> MapSet.new()
 
     %{state | members: new_members, nodes: new_nodes}
+    |> restore_local_registrations()
   end
 
-  defp process_diff(state, {:remove, {:member, member}}) do
+  defp remove_member(state, member) do
     :ets.match_delete(state.members_ets_table, {member, 1})
 
     removed_keys = :ets.match(state.keys_ets_table, {:"$1", member, {:"$2", :_}})
 
-    DeltaCrdt.drop(
-      crdt_name(state.name),
-      Enum.map(removed_keys, fn [key, _pid] -> {:key, key} end),
-      :infinity
-    )
+    Horde.RegistryCrdt.drop_member(crdt_name(state.name), member, Enum.map(removed_keys, &hd/1))
 
     Enum.each(removed_keys, fn [key, pid] ->
       unregister_local(state, key, pid)
@@ -198,44 +228,62 @@ defmodule Horde.RegistryImpl do
     %{state | members: new_members, nodes: new_nodes}
   end
 
-  defp process_diff(state, {:remove, {:registry, key}}) do
-    :ets.delete(state.name, key)
+  defp reconcile_registration(state, key) do
+    # Read the authoritative local CRDT: queued diffs may predate a newer local
+    # registration or a membership change. They must not retire a newer intent.
+    case DeltaCrdt.get(crdt_name(state.name), {:key, key}) do
+      nil ->
+        unregister_local(state, key)
+        restore_local_registrations(state, [key])
 
-    state
+      {member, pid, _value} = registration ->
+        case DeltaCrdt.get(crdt_name(state.name), {:member, member}) do
+          1 ->
+            accept_registration(state, key, registration)
+
+          nil ->
+            Horde.RegistryCrdt.drop_member(crdt_name(state.name), member, [key])
+            unregister_local(state, key, pid)
+            restore_local_registrations(state, [key])
+        end
+    end
   end
 
-  defp process_diff(state, {:add, {:key, key}, {member, pid, value}}) do
+  defp accept_registration(state, key, {member, pid, value}) do
+    already_visible? = :ets.lookup(state.keys_ets_table, key) == [{key, member, {pid, value}}]
     link_local_pid(pid)
-
     add_key_to_pids_table(state, pid, key)
 
-    with [{^key, _member, {other_pid, other_value}}] when other_pid != pid <-
-           :ets.lookup(state.keys_ets_table, key) do
-      # There was a conflict in the name registry, send the  losing PID
-      # an exit signal indicating it has lost the name registration.
+    visible_owners =
+      for {^key, _member, owner} <- :ets.lookup(state.keys_ets_table, key), do: owner
 
-      unregister_local(state, key, other_pid)
+    retained_owners =
+      case Map.fetch(state.local_registrations, key) do
+        {:ok, owner} -> [owner]
+        :error -> []
+      end
 
-      Process.exit(other_pid, {:name_conflict, {key, other_value}, state.name, pid})
-    end
+    state =
+      (visible_owners ++ retained_owners)
+      |> Enum.uniq_by(&elem(&1, 0))
+      |> Enum.reject(fn {owner, _value} -> owner == pid end)
+      |> Enum.reduce(state, fn {other_pid, other_value}, state ->
+        # Retire the losing intent before notifications. A process trapping the
+        # conflict exit must never reassert its claim on a later membership event.
+        state = retire_registration(state, key, other_pid)
+        unregister_local(state, key, other_pid)
+        Process.exit(other_pid, {:name_conflict, {key, other_value}, state.name, pid})
+        state
+      end)
 
     :ets.insert(state.keys_ets_table, {key, member, {pid, value}})
 
-    for listener <- state.listeners do
-      send(listener, {:register, state.name, key, pid, value})
+    unless already_visible? do
+      for listener <- state.listeners do
+        send(listener, {:register, state.name, key, pid, value})
+      end
     end
 
-    state
-  end
-
-  defp process_diff(state, {:remove, {:key, key}}) do
-    unregister_local(state, key)
-
-    state
-  end
-
-  defp process_diff(state, {:add, {:registry, key}, value}) do
-    :ets.insert(state.registry_ets_table, {key, value})
     state
   end
 
@@ -300,23 +348,24 @@ defmodule Horde.RegistryImpl do
 
   def handle_call({:register, key, value, pid}, _from, state) do
     Process.link(pid)
+    state = %{state | local_registrations: Map.put(state.local_registrations, key, {pid, value})}
 
-    DeltaCrdt.put(
+    Horde.RegistryCrdt.put_registration(
       crdt_name(state.name),
-      {:key, key},
-      {fully_qualified_name(state.name), pid, value},
-      :infinity
+      key,
+      {fully_qualified_name(state.name), pid, value}
     )
 
-    {:reply, {:ok, self()}, state}
+    {:reply, {:ok, self()}, reconcile_registration(state, key)}
   end
 
   def handle_call({:update_value, key, pid, value}, _from, state) do
-    DeltaCrdt.put(
+    state = %{state | local_registrations: Map.put(state.local_registrations, key, {pid, value})}
+
+    Horde.RegistryCrdt.put_registration(
       crdt_name(state.name),
-      {:key, key},
-      {fully_qualified_name(state.name), pid, value},
-      :infinity
+      key,
+      {fully_qualified_name(state.name), pid, value}
     )
 
     :ets.insert(state.keys_ets_table, {key, fully_qualified_name(state.name), {pid, value}})
@@ -325,6 +374,7 @@ defmodule Horde.RegistryImpl do
   end
 
   def handle_call({:unregister, key, pid}, _from, state) do
+    state = retire_registration(state, key, pid)
     Horde.RegistryCrdt.drop_owned(crdt_name(state.name), [key], pid)
 
     unregister_local(state, key, pid)
@@ -348,6 +398,45 @@ defmodule Horde.RegistryImpl do
 
   def handle_call(:members, _from, state) do
     {:reply, MapSet.to_list(state.members), state}
+  end
+
+  defp retire_registration(state, key, pid) do
+    case Map.get(state.local_registrations, key) do
+      {^pid, _value} -> %{state | local_registrations: Map.delete(state.local_registrations, key)}
+      _ -> state
+    end
+  end
+
+  defp restore_local_registrations(state) do
+    restore_local_registrations(state, Map.keys(state.local_registrations))
+  end
+
+  defp restore_local_registrations(state, keys) do
+    Enum.reduce(keys, state, fn key, state ->
+      case Map.get(state.local_registrations, key) do
+        {pid, value} when node(pid) == node() ->
+          if Process.alive?(pid) do
+            Horde.RegistryCrdt.restore_registration(
+              crdt_name(state.name),
+              key,
+              {fully_qualified_name(state.name), pid, value}
+            )
+
+            case DeltaCrdt.get(crdt_name(state.name), {:key, key}) do
+              {_member, other_pid, _value} when other_pid != pid ->
+                reconcile_registration(state, key)
+
+              _ ->
+                state
+            end
+          else
+            retire_registration(state, key, pid)
+          end
+
+        _ ->
+          state
+      end
+    end)
   end
 
   defp unregister_local(state, key) do
