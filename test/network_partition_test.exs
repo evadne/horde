@@ -3,7 +3,7 @@ defmodule NetworkPartitionTest do
   alias Horde.TestCluster, as: Cluster
 
   setup do
-    peers = Cluster.start_nodes("partition", 2)
+    peers = Cluster.start_nodes("partition", 2, connect_manager: false)
     members = Cluster.nodes(peers)
 
     for peer <- peers do

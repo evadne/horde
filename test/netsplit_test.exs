@@ -3,7 +3,9 @@ defmodule NetSplitTest do
   alias Horde.TestCluster, as: Cluster
 
   test "two live components retain their workers and converge after healing" do
-    [first, second, third, fourth] = peers = Cluster.start_nodes("netsplit", 4)
+    [first, second, third, fourth] =
+      peers = Cluster.start_nodes("netsplit", 4, connect_manager: false)
+
     groups = [[first, second], [third, fourth]]
     nodes = Cluster.nodes(peers)
 

@@ -17,16 +17,23 @@ defmodule Horde.TestCluster do
           args: [~c"+S", ~c"2", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
         })
 
-      peer = %{controller: controller, node: node}
+      peer = %{
+        controller: controller,
+        node: node,
+        manager: if(Keyword.get(options, :connect_manager, true), do: node(), else: nil)
+      }
+
       ExUnit.Callbacks.on_exit(fn -> stop(peer) end)
       true = call(peer, :application, :get_env, [:kernel, :prevent_overlapping_partitions, true])
       :ok = call(peer, :code, :add_paths, [:code.get_path()])
+
+      {:ok, _} = call(peer, Horde.TestCluster.NodeEvents, :start, [])
 
       for app <- Keyword.get(options, :applications, [:horde, :test_app]) do
         {:ok, _} = call(peer, Application, :ensure_all_started, [app])
       end
 
-      true = call(peer, Node, :connect, [node()])
+      if peer.manager, do: true = call(peer, Node, :connect, [peer.manager])
       peer
     end
   end
@@ -54,6 +61,7 @@ defmodule Horde.TestCluster do
 
     %{
       connected: Node.list(),
+      node_events: Horde.TestCluster.NodeEvents.events(),
       members: state.members_info,
       supervised: :ets.tab2list(state.processes_by_id),
       children: Horde.ProcessesSupervisor.which_children(TestSup.ProcessesSupervisor),
@@ -76,7 +84,8 @@ defmodule Horde.TestCluster do
   end
 
   def partition(groups) do
-    all_nodes = [node() | nodes(List.flatten(groups))]
+    peers = List.flatten(groups)
+    all_nodes = network_nodes(peers)
 
     # Distinct cookies prevent application traffic and global from healing the
     # cut. Explicit per-node cookies also replace any cached authentication.
@@ -94,8 +103,10 @@ defmodule Horde.TestCluster do
       end
     end
 
-    # global can discard additional connections while a split forms. Restore
-    # each intended, fully connected component without disabling that protection.
+    # Sequential cuts can make global remove working connections inside the
+    # intended groups too. This exercises fragmentation followed by recovery of
+    # each component, not an atomic 2+2 cut. Record all node events for diagnosis.
+    # Restore the intended components without disabling OTP protection.
     for group <- groups, do: connect(group, nodes(group))
 
     assert_partition(groups)
@@ -112,11 +123,16 @@ defmodule Horde.TestCluster do
   end
 
   def heal(peers) do
-    for peer <- peers, other <- [node() | nodes(peers)] do
+    for peer <- peers, other <- network_nodes(peers) do
       true = call(peer, :erlang, :set_cookie, [other, Node.get_cookie()])
     end
 
-    connect(peers, [node() | nodes(peers)])
+    connect(peers, network_nodes(peers))
+  end
+
+  defp network_nodes(peers) do
+    managers = peers |> Enum.map(& &1.manager) |> Enum.reject(&is_nil/1)
+    Enum.uniq(nodes(peers) ++ managers)
   end
 
   defp connect(peers, expected) do
