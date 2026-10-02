@@ -20,7 +20,18 @@ defmodule Horde.ProxyOperationTest do
     reply_tag = make_ref()
     :ok = Horde.ProxyOperation.forward(destination, :request, {self(), reply_tag}, :infinity)
     assert_receive {:delivered, ^destination, {:proxy_operation, :request, relay_from}}
-    {reply_tag, relay_from, Process.monitor(elem(relay_from, 0))}
+    relay = elem(relay_from, 0)
+    monitor = monitor_relay(relay)
+    {reply_tag, relay_from, monitor}
+  end
+
+  defp monitor_relay(relay) do
+    monitor = Process.monitor(relay)
+    # Monitor installation may complete asynchronously on current OTP. Confirm
+    # it before another process can make the relay exit and yield :noproc.
+    assert {:monitored_by, observers} = Process.info(relay, :monitored_by)
+    assert self() in observers
+    monitor
   end
 
   test "returns an uncertain error when the destination dies before replying" do
@@ -89,7 +100,7 @@ defmodule Horde.ProxyOperationTest do
     tag = make_ref()
     :ok = Horde.ProxyOperation.forward(destination, :request, {caller, tag}, :infinity)
     assert_receive {:delivered, ^destination, {:proxy_operation, :request, {relay, _}}}
-    monitor = Process.monitor(relay)
+    monitor = monitor_relay(relay)
     Process.exit(caller, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^relay, :normal}
     Process.exit(destination, :kill)
@@ -107,7 +118,7 @@ defmodule Horde.ProxyOperationTest do
       end)
 
     assert_receive {:delivered, ^destination, {:proxy_operation, :request, {relay, _}}}
-    monitor = Process.monitor(relay)
+    monitor = monitor_relay(relay)
     Process.exit(owner, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^relay, :normal}
     Process.exit(destination, :kill)

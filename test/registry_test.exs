@@ -373,14 +373,18 @@ defmodule RegistryTest do
       Horde.Cluster.set_members(horde, [horde, horde2])
 
       Horde.Registry.register(horde, :one_day_fly, "value")
-      assert %{one_day_fly: _id} = processes(horde)
-      Process.sleep(200)
-      assert %{one_day_fly: _id} = processes(horde2)
+
+      Horde.TestCluster.await("publication of the registration on both members", fn ->
+        match?(%{one_day_fly: _id}, processes(horde)) and
+          match?(%{one_day_fly: _id}, processes(horde2))
+      end)
 
       Horde.Registry.unregister(horde, :one_day_fly)
       assert %{} == processes(horde)
-      Process.sleep(200)
-      assert %{} == processes(horde2)
+
+      Horde.TestCluster.await("replication of the unregistration", fn ->
+        processes(horde2) == %{}
+      end)
     end
   end
 
@@ -879,29 +883,41 @@ defmodule RegistryTest do
       reg = start_registry(listeners: [:test_process], keys: :unique)
       reg2 = start_registry(keys: :unique)
 
+      supervisor = start_supervised!(Task.Supervisor)
+
       t1 =
-        Task.async(fn ->
+        Task.Supervisor.async_nolink(supervisor, fn ->
           Horde.Registry.register(reg, :task, :task_value)
-          Process.sleep(1000)
+          Process.sleep(:infinity)
         end)
 
-      Process.sleep(100)
+      %{pid: t1_pid, ref: t1_ref} = t1
+      assert_receive {:register, ^reg, :task, ^t1_pid, :task_value}, 200
+      published_at = System.system_time(:millisecond)
+
+      # Establish the later LWW timestamp instead of assuming that a sleeping
+      # task has already registered. The losing task is expected to exit, so it
+      # must not be linked to the process making the assertions.
+      Horde.TestCluster.await("a later registration timestamp", fn ->
+        System.system_time(:millisecond) > published_at
+      end)
 
       t2 =
-        Task.async(fn ->
+        Task.Supervisor.async_nolink(supervisor, fn ->
           Horde.Registry.register(reg2, :task, :task_value)
-          Process.sleep(1000)
+          Process.sleep(:infinity)
         end)
 
-      %{pid: t1_pid} = t1
+      %{pid: t2_pid} = t2
 
-      assert_receive {:register, ^reg, :task, ^t1_pid, :task_value}, 200
+      Horde.TestCluster.await("publication of the conflicting registration", fn ->
+        Horde.Registry.lookup(reg2, :task) == [{t2_pid, :task_value}]
+      end)
 
       Horde.Cluster.set_members(reg, [reg, reg2])
-
-      %{pid: t2_pid} = t2
       assert_receive {:unregister, ^reg, :task, ^t1_pid}, 200
       assert_receive {:register, ^reg, :task, ^t2_pid, :task_value}, 200
+      assert_receive {:DOWN, ^t1_ref, :process, ^t1_pid, {:name_conflict, _, _, ^t2_pid}}, 200
     end
   end
 
@@ -930,6 +946,12 @@ defmodule RegistryTest do
       end)
 
     assert_receive {:ok, owner}
+    # Since Horde 0.9, even local registration is published asynchronously (see
+    # upstream issue 250). Establish visibility before testing duplicate rejection.
+    Horde.TestCluster.await("the initial registration to become visible", fn ->
+      Horde.Registry.lookup(registry, key) == [{task, value}]
+    end)
+
     {owner, task}
   end
 

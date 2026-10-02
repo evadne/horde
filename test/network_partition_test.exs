@@ -1,156 +1,98 @@
 defmodule NetworkPartitionTest do
   use ExUnit.Case
-
-  @retry_attempts 20
-  @retry_sleep_ms 100
+  alias Horde.TestCluster, as: Cluster
 
   setup do
-    nodes = LocalCluster.start_nodes("cluster#{:erlang.unique_integer()}", 2)
+    peers = Cluster.start_nodes("partition", 2, connect_manager: false)
+    members = Cluster.nodes(peers)
 
-    for n <- nodes do
-      :erpc.call(n, Application, :ensure_all_started, [:test_app])
+    for peer <- peers do
+      :ok =
+        Cluster.call(peer, Horde.Cluster, :set_members, [
+          TestReg,
+          Enum.map(members, &{TestReg, &1})
+        ])
+
+      :ok =
+        Cluster.call(peer, Horde.Cluster, :set_members, [
+          TestSup,
+          Enum.map(members, &{TestSup, &1})
+        ])
     end
 
-    [nodes: nodes]
+    Cluster.heal(peers)
+    [peers: peers]
   end
 
-  test "recovers as expected in case of network partition", %{nodes: [n1, n2] = nodes} do
-    assert {:ok, _pid1} =
-             Horde.DynamicSupervisor.start_child(
-               {TestSup, n1},
-               {IgnoreWorker, {:via, Horde.Registry, {TestReg, IgnoreWorker}}}
-             )
+  test "recovers after a partition while both nodes and the original worker survive", %{
+    peers: [first, second] = peers
+  } do
+    {:ok, original} = Cluster.call(first, Worker, :start, ["partition-worker"])
+    owner = Enum.find(peers, &(&1.node == node(original)))
+    assert :ok = Cluster.call(owner, Worker, :set_state, [original, "preserved"])
+    await_registered(peers, "partition-worker", original)
+    Cluster.await_supervised(peers, [original])
+    identities = Enum.map(peers, &Cluster.call(&1, Process, :whereis, [TestApp.Supervisor]))
 
-    assert {:ok, _pid2} =
-             Horde.DynamicSupervisor.start_child(
-               {TestSup, n2},
-               {IgnoreWorker, {:via, Horde.Registry, {TestReg, IgnoreWorker}}}
-             )
+    Cluster.partition([[first], [second]])
+    assert Cluster.call(owner, Process, :alive?, [original])
+    assert {:ok, "preserved"} = Cluster.call(owner, GenServer, :call, [original, :state])
 
-    reg_members = for n <- nodes, do: {TestReg, n}
-    sup_members = for n <- nodes, do: {TestSup, n}
+    assert identities ==
+             Enum.map(peers, &Cluster.call(&1, Process, :whereis, [TestApp.Supervisor]))
 
-    for n <- nodes do
-      :ok = :erpc.call(n, Horde.Cluster, :set_members, [TestReg, reg_members])
-      :ok = :erpc.call(n, Horde.Cluster, :set_members, [TestSup, sup_members])
-    end
+    Cluster.await("a local replacement in each partition", fn ->
+      Enum.all?(peers, fn peer ->
+        pid = lookup(peer, "partition-worker")
+        is_pid(pid) and node(pid) == peer.node and Cluster.call(peer, Process, :alive?, [pid])
+      end)
+    end)
 
-    partition_id = "partition-#{System.unique_integer([:positive])}"
-    :ok = partition_with_retry([n1, n2], partition_id)
+    partition_pids = Enum.map(peers, &lookup(&1, "partition-worker"))
+    assert length(Enum.uniq(partition_pids)) == 2
+    Cluster.assert_partition([[first], [second]])
+    Cluster.heal(peers)
 
-    Process.sleep(100)
+    Cluster.await("registry agreement and exactly one surviving worker after healing", fn ->
+      pids = Enum.map(peers, &lookup(&1, "partition-worker"))
 
-    :ok = heal_with_retry([n1, n2])
-    :ok = assert_nodes_connected([n1, n2])
+      alive =
+        Enum.filter(partition_pids, fn pid ->
+          peer = Enum.find(peers, &(&1.node == node(pid)))
+          Cluster.call(peer, Process, :alive?, [pid])
+        end)
 
-    Process.sleep(100)
+      match?([pid] when is_pid(pid), Enum.uniq(pids)) and alive == Enum.uniq(pids)
+    end)
 
-    assert [{_, pid, _, _}] = Horde.DynamicSupervisor.which_children({TestSup, n1})
-    assert [{_, ^pid, _, _}] = Horde.DynamicSupervisor.which_children({TestSup, n2})
-
-    assert true = :erpc.call(node(pid), Process, :alive?, [pid])
+    assert identities ==
+             Enum.map(peers, &Cluster.call(&1, Process, :whereis, [TestApp.Supervisor]))
   end
 
-  test "recovers as expected in case of node stopping", %{nodes: [n1, n2] = nodes} do
-    assert {:ok, _pid1} =
-             Horde.DynamicSupervisor.start_child(
-               {TestSup, n1},
-               {IgnoreWorker, {:via, Horde.Registry, {TestReg, IgnoreWorker}}}
-             )
+  test "restarts the worker on the surviving node after its owner stops", %{
+    peers: [first | _] = peers
+  } do
+    {:ok, original} = Cluster.call(first, Worker, :start, ["stopped-worker"])
+    await_registered(peers, "stopped-worker", original)
+    Cluster.await_supervised(peers, [original])
+    owner = Enum.find(peers, &(&1.node == node(original)))
+    survivor = Enum.find(peers, &(&1 != owner))
+    Cluster.stop(owner)
 
-    assert {:ok, _pid2} =
-             Horde.DynamicSupervisor.start_child(
-               {TestSup, n2},
-               {IgnoreWorker, {:via, Horde.Registry, {TestReg, IgnoreWorker}}}
-             )
+    Cluster.await("a replacement on the surviving node", fn ->
+      pid = lookup(survivor, "stopped-worker")
 
-    require Logger
-    Logger.info("stitching together cluster")
-
-    reg_members = for n <- nodes, do: {TestReg, n}
-    sup_members = for n <- nodes, do: {TestSup, n}
-
-    for n <- nodes do
-      :ok = :erpc.call(n, Horde.Cluster, :set_members, [TestReg, reg_members])
-      :ok = :erpc.call(n, Horde.Cluster, :set_members, [TestSup, sup_members])
-    end
-
-    Process.sleep(100)
-
-    Logger.info("stopping #{n2}")
-    LocalCluster.stop_nodes([n2])
-
-    Process.sleep(100)
-
-    assert [{_, pid, _, _}] = Horde.DynamicSupervisor.which_children({TestSup, n1})
-
-    assert true = :erpc.call(node(pid), Process, :alive?, [pid])
-  end
-
-  defp partition_with_retry(nodes, partition_id) do
-    retry(fn ->
-      try do
-        Schism.partition(nodes, partition_id)
-        :ok
-      rescue
-        MatchError -> {:error, :partition_not_ready}
-      end
+      is_pid(pid) and pid != original and node(pid) == survivor.node and
+        Cluster.call(survivor, Process, :alive?, [pid])
     end)
   end
 
-  defp heal_with_retry(nodes) do
-    retry(fn ->
-      try do
-        Schism.heal(nodes)
+  defp lookup(peer, name),
+    do: Cluster.call(peer, Horde.Registry, :whereis_name, [{TestReg, name}])
 
-        if Enum.all?(nodes, fn node -> Node.ping(node) == :pong end) do
-          :ok
-        else
-          {:error, :nodes_not_reachable}
-        end
-      rescue
-        MatchError -> {:error, :heal_not_ready}
-      end
+  defp await_registered(peers, name, pid) do
+    Cluster.await("replication of the worker registration", fn ->
+      Enum.all?(peers, &(lookup(&1, name) == pid))
     end)
-  end
-
-  defp assert_nodes_connected(nodes) do
-    retry(fn ->
-      manager = node()
-
-      if Enum.all?(nodes, fn remote ->
-           expected = MapSet.new([manager | nodes])
-
-           case :erpc.call(remote, Node, :list, [[:visible, :this]]) do
-             visible when is_list(visible) ->
-               visible
-               |> MapSet.new()
-               |> MapSet.equal?(expected)
-
-             _ ->
-               false
-           end
-         end) do
-        :ok
-      else
-        {:error, :cluster_not_fully_connected}
-      end
-    end)
-  end
-
-  defp retry(fun, attempts \\ @retry_attempts)
-
-  defp retry(fun, attempts) when attempts > 0 do
-    case fun.() do
-      :ok ->
-        :ok
-
-      {:error, _reason} when attempts == 1 ->
-        flunk("operation did not converge after #{@retry_attempts} attempts")
-
-      {:error, _reason} ->
-        Process.sleep(@retry_sleep_ms)
-        retry(fun, attempts - 1)
-    end
   end
 end

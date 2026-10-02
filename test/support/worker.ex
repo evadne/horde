@@ -32,6 +32,7 @@ defmodule Worker do
   end
 
   def init(name) do
+    Process.flag(:trap_exit, true)
     Logger.info("Starting worker on #{inspect(Node.self())}")
     {:ok, %__MODULE__{name: name}, {:continue, :started}}
   end
@@ -49,10 +50,17 @@ defmodule Worker do
     {:reply, {:ok, state.state}, state}
   end
 
+  # Follow Horde's documented conflict protocol: a duplicate retires normally
+  # instead of triggering a restart storm when partitions merge.
+  def handle_info({:EXIT, _from, {:name_conflict, _, _, _}}, state) do
+    {:stop, :normal, state}
+  end
+
   defp child_spec(name: name) do
     %{
       id: String.to_atom("#{__MODULE__}_#{name}"),
       start: {__MODULE__, :start_link, [name]},
+      restart: :transient,
       shutdown: 10_000
     }
   end
