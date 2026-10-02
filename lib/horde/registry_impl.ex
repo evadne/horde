@@ -275,7 +275,13 @@ defmodule Horde.RegistryImpl do
         # conflict exit must never reassert its claim on a later membership event.
         state = retire_registration(state, key, other_pid)
         unregister_local(state, key, other_pid)
-        Process.exit(other_pid, {:name_conflict, {key, other_value}, state.name, pid})
+        # Only the owner's Registry can retire its process. A remote conflict
+        # signal can be delayed by distribution and arrive after its advertised
+        # winner has already lost, killing both workers despite converged state.
+        if node(other_pid) == node() do
+          Process.exit(other_pid, {:name_conflict, {key, other_value}, state.name, pid})
+        end
+
         state
       end)
 
