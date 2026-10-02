@@ -97,14 +97,7 @@ defmodule HelloWorld.SayHello do
   end
 
   def start_link(name) do
-    case GenServer.start_link(__MODULE__, [], name: via_tuple(name)) do
-      {:ok, pid} ->
-        {:ok, pid}
-
-      {:error, {:already_started, pid}} ->
-        Logger.info("already started at #{inspect(pid)}, returning :ignore")
-        :ignore
-    end
+    GenServer.start_link(__MODULE__, [], name: via_tuple(name))
   end
 
   def init(_args) do
